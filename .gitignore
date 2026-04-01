@@ -1,0 +1,6 @@
+*.log
+zeek_logs
+
+.env
+
+__pycache__
