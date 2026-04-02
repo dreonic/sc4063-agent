@@ -53,7 +53,7 @@ def build_micro_tools(
     # list_available_logs and ingest_pcap can give directed recovery hints.
     _attempted_pcaps: list[str] = []   # all pcap_filename values tried
     _successful_pcaps: list[str] = []  # ones that produced at least one log
-    _get_time_range_call_count = [0]   # hard limiter — refuse after 2 calls
+    _get_time_range_call_count: dict[str, int] = {}   # per-log limiter
 
     # ------------------------------------------------------------------
     # Zeek log micro tools
@@ -193,13 +193,12 @@ def build_micro_tools(
 
     @tool
     def get_time_range(log_name: str) -> str:
-        """Get the earliest and latest timestamp in a Zeek log file. Call this AT MOST ONCE for conn.log during Phase 1. After seeing the result, immediately act on it — do NOT call this tool again."""
-        _get_time_range_call_count[0] += 1
-        if _get_time_range_call_count[0] > 2:
+        """Get the earliest and latest timestamp in a Zeek log file. Each log may be queried at most twice — act on the result immediately rather than re-checking."""
+        _get_time_range_call_count[log_name] = _get_time_range_call_count.get(log_name, 0) + 1
+        if _get_time_range_call_count[log_name] > 2:
             return (
-                "ERROR: get_time_range already called. Do NOT call it again.\n"
-                "You already know the coverage. If it was insufficient, call ingest_pcap now.\n"
-                "If coverage was adequate, proceed to Phase 2 macro analysis tools."
+                f"ERROR: get_time_range already called twice for {log_name}. Do NOT call it again. "
+                "Act on the result you already have."
             )
         log_path = Path(log_dir) / log_name
         if not log_path.exists():
@@ -231,14 +230,20 @@ def build_micro_tools(
                 f"{stats_mod.epoch_to_human(earliest)} to {stats_mod.epoch_to_human(latest)} "
                 f"({span_days:.1f} days)"
             )
-            if span_days < 60:
+            if span_days < 20:
                 msg += (
-                    f"\nCoverage is {span_days:.1f} days — INSUFFICIENT (need ≥20 days). "
+                    f"\nCoverage is {span_days:.1f} days — too narrow. "
                     "Call list_pcap_files to see available date groups, then ingest_pcap "
                     "for each uncovered group."
                 )
+            elif span_days < 73:
+                msg += (
+                    f"\nCoverage is {span_days:.1f} days — this is all the data available in the PCAP dataset "
+                    f"(full incident is ~73 days but the capture does not cover the entire window). "
+                    f"Note this gap in findings and proceed to Phase 2."
+                )
             else:
-                msg += f"\nCoverage is adequate ({span_days:.1f} days ≥ 20). Proceed to Phase 2."
+                msg += f"\nFull incident window covered ({span_days:.1f} days). Proceed to Phase 2."
             return msg
         except ValueError:
             return f"No valid timestamps found in {log_name}."
@@ -288,6 +293,46 @@ def build_micro_tools(
                 import re as _re
 
                 _list_pcap_call_count[0] += 1
+
+                # If Zeek logs already exist with adequate coverage, skip ingestion
+                _existing_logs = list(Path(log_dir).glob("*.log"))
+                if _existing_logs and _list_pcap_call_count[0] == 1:
+                    # Quick coverage check via conn.log
+                    _conn = Path(log_dir) / "conn.log"
+                    if _conn.exists():
+                        try:
+                            import struct as _struct2, datetime as _dt2
+                            _file_size = _conn.stat().st_size
+                            _chunk = min(32768, _file_size)
+                            with open(_conn, "rb") as _fh:
+                                _fh.seek(max(0, _file_size - _chunk))
+                                _tail_bytes = _fh.read()
+                            _tail_lines = [l for l in _tail_bytes.decode("utf-8", errors="replace").splitlines()
+                                           if l.strip() and not l.startswith("#")]
+                            _head_lines: list[str] = []
+                            with open(_conn, "r", encoding="utf-8", errors="replace") as _fh2:
+                                for _line in _fh2:
+                                    if not _line.startswith("#") and _line.strip():
+                                        _head_lines.append(_line)
+                                        if len(_head_lines) >= 5:
+                                            break
+                            _ts_vals = []
+                            for _raw in (_head_lines[:3] + _tail_lines[-3:]):
+                                try:
+                                    _ts_vals.append(float(_raw.split("\t", 1)[0]))
+                                except Exception:
+                                    pass
+                            if len(_ts_vals) >= 2:
+                                _span = (max(_ts_vals) - min(_ts_vals)) / 86400
+                                if _span >= 20:
+                                    return (
+                                        f"Zeek logs already exist with {_span:.1f} days of coverage — "
+                                        f"adequate for analysis. Do NOT ingest more PCAPs.\n"
+                                        f"Call list_available_logs to review logs, then proceed to Phase 2."
+                                    )
+                        except Exception:
+                            pass
+
                 if _list_pcap_call_count[0] > 1:
                     # Find first UNTRIED representative file to direct the agent
                     pcaps_hint = sorted(
@@ -325,7 +370,7 @@ def build_micro_tools(
                             pkt_hdr = fh.read(16)
                             if len(pkt_hdr) >= 8:
                                 ts_sec = struct.unpack("<I", pkt_hdr[:4])[0]
-                                return datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M UTC")
+                                return datetime.datetime.fromtimestamp(ts_sec, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                     except Exception:
                         pass
                     return "?"

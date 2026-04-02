@@ -230,37 +230,69 @@ def _format_hosts(hosts: list[dict]) -> str:
     return "\n".join(lines) if lines else "  (no hosts discovered)"
 
 
-def _pick_representative_pcaps(pcap_dir: Path) -> list[str]:
-    """Select one PCAP per date group in the filename (e.g. "250301", "250302" …).
+def _pick_representative_pcaps(pcap_dir: Path, n: int = 18) -> list[str]:
+    """Select ~n PCAPs evenly distributed across the actual packet timestamp range.
 
-    Filenames follow the pattern ``34936-sensor-YYMMDD-NNNNN_redacted.pcap``.
-    Selecting the first file from each date group gives maximum temporal diversity.
-    Falls back to evenly-spaced selection if no date pattern is found.
+    Reads the first-packet timestamp from each PCAP's global header (40 bytes)
+    and selects files whose timestamps are evenly spaced across the full span.
+    This gives much better temporal coverage than batch-label grouping, since
+    files from different batch groups can cover the same or different time windows.
+
+    Falls back to alphabetical even-spacing if timestamps cannot be read.
     """
-    import re as _re
+    import struct as _struct
+    import datetime as _dt
 
     pcaps = sorted(
-        p.name for p in pcap_dir.iterdir()
+        p for p in pcap_dir.iterdir()
         if p.suffix in (".pcap", ".pcapng")
     )
     if not pcaps:
         return []
 
-    seen: set[str] = set()
-    representatives: list[str] = []
-    for name in pcaps:
-        m = _re.search(r'-(\d{6})-', name)
-        key = m.group(1) if m else name
-        if key not in seen:
-            seen.add(key)
-            representatives.append(name)
+    # Read first-packet timestamp from each file
+    timed: list[tuple[float, str]] = []
+    for p in pcaps:
+        try:
+            with open(p, "rb") as fh:
+                fh.read(24)  # global header
+                hdr = fh.read(16)
+                if len(hdr) >= 8:
+                    ts = _struct.unpack("<I", hdr[:4])[0]
+                    timed.append((float(ts), p.name))
+        except Exception:
+            pass
 
-    # Fallback: if no date pattern matched at all, use evenly-spaced
-    if len(representatives) == len(pcaps) and len(pcaps) > 9:
-        step = (len(pcaps) - 1) / 8
-        representatives = [pcaps[round(i * step)] for i in range(9)]
+    if len(timed) < 2:
+        # Fallback: evenly-spaced alphabetically
+        names = [p.name for p in pcaps]
+        step = max(1, (len(names) - 1) / (n - 1))
+        return [names[round(i * step)] for i in range(min(n, len(names)))]
 
-    return representatives
+    timed.sort(key=lambda x: x[0])
+    earliest_ts = timed[0][0]
+    latest_ts = timed[-1][0]
+    span = latest_ts - earliest_ts
+
+    if span == 0 or len(timed) <= n:
+        return [name for _, name in timed]
+
+    # Pick files whose timestamps are closest to evenly-spaced target times
+    selected: list[str] = []
+    used: set[str] = set()
+    for i in range(n):
+        target = earliest_ts + (span * i / (n - 1))
+        best = min(timed, key=lambda x: (abs(x[0] - target), x[1] in used))
+        if best[1] not in used:
+            selected.append(best[1])
+            used.add(best[1])
+
+    earliest_dt = _dt.datetime.fromtimestamp(earliest_ts, _dt.timezone.utc).strftime("%Y-%m-%d")
+    latest_dt = _dt.datetime.fromtimestamp(latest_ts, _dt.timezone.utc).strftime("%Y-%m-%d")
+    print(f"[INVESTIGATE] PCAP timestamp range: {earliest_dt} to {latest_dt} "
+          f"({span/86400:.1f} days) — selected {len(selected)} representative files")
+
+    return selected
 
 
 def investigate_node(state: ForensicState) -> dict:

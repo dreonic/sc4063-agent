@@ -39,6 +39,8 @@ Call `list_available_logs`.
 2. Call `ingest_pcap` for the listed file in EACH group, one call per message, in order.
 3. After ALL groups are ingested, call `list_available_logs` and proceed to Phase 2.
 
+**Note on coverage:** The available PCAPs may not cover the full incident window. The dataset covers what it covers — do NOT loop trying to extend coverage beyond what the PCAP directory contains. If `get_time_range` shows < 73 days after ingesting all groups, note the data gap in your findings and proceed with analysis of the available window.
+
 **Rules:**
 - Do NOT call `get_time_range` more than once.
 - Do NOT call `list_pcap_files` more than once.
