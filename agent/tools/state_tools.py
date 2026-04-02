@@ -90,7 +90,7 @@ def build_state_tools(state_ref: dict[str, Any]):
             return f"REJECTED: {err}"
 
         _finding_counter[0] += 1
-        finding_id = chr(64 + _finding_counter[0]) if _finding_counter[0] <= 26 else str(_finding_counter[0])
+        finding_id = f"MI-{_finding_counter[0]:03d}"
 
         finding = {
             "id": finding_id,
@@ -149,7 +149,7 @@ def build_state_tools(state_ref: dict[str, Any]):
         phase: str = "investigation",
         mitre_id: str = "",
     ) -> str:
-        """Record a timeline event for the attack chronology.
+        """Record a timeline event for the attack chronology. Maximum 30 events total — stop recording and call mark_investigation_complete when the key events are captured.
 
         Args:
             timestamp: The timestamp (epoch float as string, or human-readable).
@@ -159,6 +159,11 @@ def build_state_tools(state_ref: dict[str, Any]):
             phase: Which investigation phase this belongs to.
             mitre_id: Optional MITRE technique ID.
         """
+        if len(ref["timeline_events"]) >= 30:
+            return (
+                "Timeline event limit reached (30 events). "
+                "Stop recording and call mark_investigation_complete."
+            )
         event = {
             "timestamp": timestamp,
             "description": description,
@@ -168,7 +173,9 @@ def build_state_tools(state_ref: dict[str, Any]):
             "mitre_id": mitre_id,
         }
         ref["timeline_events"].append(event)
-        return f"Timeline event recorded: {description[:80]}"
+        remaining = 30 - len(ref["timeline_events"])
+        suffix = f" ({remaining} slots remaining)" if remaining <= 5 else ""
+        return f"Timeline event recorded: {description[:80]}{suffix}"
 
     @tool
     def mark_investigation_complete() -> str:

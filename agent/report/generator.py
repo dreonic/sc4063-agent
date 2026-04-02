@@ -71,14 +71,24 @@ class ReportGenerator:
 
     def _render_header(self) -> str:
         r = self.report
+
+        # Derive capture window from timeline if not explicitly set
+        capture_window = getattr(r, 'capture_window', '') or ''
+        if not capture_window and getattr(r, 'timeline', []):
+            sorted_tl = sorted(r.timeline, key=lambda e: e.timestamp)
+            t0 = sorted_tl[0].timestamp_human.split()[0] if sorted_tl else ''
+            t1 = sorted_tl[-1].timestamp_human.split()[0] if sorted_tl else ''
+            capture_window = f"{t0} – {t1}" if t0 and t1 else "Nov 2025 – Jan 2026"
+        capture_window = capture_window or "Nov 2025 – Jan 2026"
+
         lines = [
             "# Apex Global Logistics - Incident Response Report",
             "",
             "| Field | Value |",
             "| --- | --- |",
-            f"| **Client** | {getattr(r, 'client', 'Apex Global Logistics')} |",
-            f"| **Capture Window** | {getattr(r, 'capture_window', 'Nov 17, 2025 - Jan 29, 2026')} |",
-            f"| **Data Source** | {getattr(r, 'data_source', 'Zeek Logs')} |",
+            f"| **Client** | {getattr(r, 'client', '') or 'Apex Global Logistics'} |",
+            f"| **Capture Window** | {capture_window} |",
+            f"| **Data Source** | {getattr(r, 'data_source', '') or 'Zeek Logs (from PCAP)'} |",
             f"| **Internal Subnet** | {getattr(r, 'internal_subnet', '10.128.239.0/24')} |",
             f"| **Domain** | {getattr(r, 'domain', 'domain-ees3Ai.local')} |",
             f"| **Report Generated** | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} |",

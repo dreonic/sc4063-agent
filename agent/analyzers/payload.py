@@ -238,7 +238,7 @@ class PayloadAnalyzer:
             )
 
         for rec in records[:3]:
-            self._add_timeline(rec, "payload", f"PE binary observed (arch={rec.get('machine', 'unknown')})", "pe.log", "T1059.001")
+            self._add_timeline(rec, "payload", f"PE binary observed (arch={rec.get('machine', 'unknown')})", "pe.log", "T1105")
 
         evidence = Evidence(
             source_log="pe.log",
@@ -267,9 +267,9 @@ class PayloadAnalyzer:
             severity=sev,
             evidence=[evidence],
             mitre=[MITREMapping(
-                tactic="Execution",
-                technique="Command and Scripting Interpreter: PowerShell",
-                technique_id="T1059.001",
+                tactic="Command and Control",
+                technique="Ingress Tool Transfer",
+                technique_id="T1105",
                 observed_evidence=f"{len(records)} PE files analyzed",
             )],
         )

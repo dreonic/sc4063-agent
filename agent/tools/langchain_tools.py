@@ -49,6 +49,12 @@ def build_micro_tools(
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
     ]
 
+    # Shared ingestion state — tracks attempted and successful PCAPs so that
+    # list_available_logs and ingest_pcap can give directed recovery hints.
+    _attempted_pcaps: list[str] = []   # all pcap_filename values tried
+    _successful_pcaps: list[str] = []  # ones that produced at least one log
+    _get_time_range_call_count = [0]   # hard limiter — refuse after 2 calls
+
     # ------------------------------------------------------------------
     # Zeek log micro tools
     # ------------------------------------------------------------------
@@ -56,12 +62,39 @@ def build_micro_tools(
     @tool
     def list_available_logs() -> str:
         """List all Zeek log files in the analysis directory with their field names and sizes."""
+        import re as _re
         log_path = Path(log_dir)
         logs = sorted(log_path.glob("*.log"))
         if not logs:
-            msg = "No .log files found in the current working log directory."
+            msg = "No Zeek logs found yet."
             if pcap_path and Path(pcap_path).is_dir():
-                msg += " Hint: Use `list_available_pcaps` and `ingest_pcap` to populate this directory from PCAP sources."
+                # Find the next untried representative PCAP and direct the agent to it
+                _pcap_dir = Path(pcap_path)
+                all_pcaps = sorted(p.name for p in _pcap_dir.iterdir() if p.suffix in {".pcap", ".pcapng"})
+                seen_groups: set[str] = set()
+                reps: list[str] = []
+                for name in all_pcaps:
+                    m = _re.search(r'-(\d{6})-', name)
+                    key = m.group(1) if m else name
+                    if key not in seen_groups:
+                        seen_groups.add(key)
+                        reps.append(name)
+                untried = [f for f in reps if f not in _attempted_pcaps]
+                if untried:
+                    next_file = untried[0]
+                    msg += (
+                        f" You have tried: {_attempted_pcaps or 'nothing yet'}.\n"
+                        f"Call ingest_pcap NOW with the next untried file:\n"
+                        f'{{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{next_file}"}}}}'
+                    )
+                elif _attempted_pcaps:
+                    msg += (
+                        f" All representative PCAPs have been tried: {_attempted_pcaps}.\n"
+                        "If ingestion failed, check whether Zeek (WSL) is working. "
+                        "Try: ingest_pcap with a different file from the list."
+                    )
+                else:
+                    msg += " Call ingest_pcap with a PCAP filename to populate logs."
             return msg
         lines = []
         for lp in logs:
@@ -160,15 +193,53 @@ def build_micro_tools(
 
     @tool
     def get_time_range(log_name: str) -> str:
-        """Get the earliest and latest timestamp in a Zeek log file."""
-        rdr = _reader(log_dir, log_name)
-        records = rdr.read_head(5000)
-        try:
-            earliest, latest = stats_mod.time_range(records)
+        """Get the earliest and latest timestamp in a Zeek log file. Call this AT MOST ONCE for conn.log during Phase 1. After seeing the result, immediately act on it — do NOT call this tool again."""
+        _get_time_range_call_count[0] += 1
+        if _get_time_range_call_count[0] > 2:
             return (
-                f"Time range in {log_name}: "
-                f"{stats_mod.epoch_to_human(earliest)} to {stats_mod.epoch_to_human(latest)}"
+                "ERROR: get_time_range already called. Do NOT call it again.\n"
+                "You already know the coverage. If it was insufficient, call ingest_pcap now.\n"
+                "If coverage was adequate, proceed to Phase 2 macro analysis tools."
             )
+        log_path = Path(log_dir) / log_name
+        if not log_path.exists():
+            return f"{log_name} not found."
+        rdr = _reader(log_dir, log_name)
+        head = rdr.read_head(100)
+        # Efficiently read last ~100 data lines using binary seek from EOF
+        tail: list[dict] = []
+        try:
+            file_size = log_path.stat().st_size
+            chunk = min(32768, file_size)
+            with open(log_path, "rb") as fh:
+                fh.seek(max(0, file_size - chunk))
+                raw_bytes = fh.read()
+            tail_text = raw_bytes.decode("utf-8", errors="replace")
+            tail_lines = [l for l in tail_text.splitlines() if l.strip() and not l.startswith("#")]
+            for raw in tail_lines[-100:]:
+                rec = rdr._parse_line(raw)
+                if rec is not None:
+                    tail.append(rec)
+        except Exception:
+            pass
+        all_records = head + tail
+        try:
+            earliest, latest = stats_mod.time_range(all_records)
+            span_days = (latest - earliest) / 86400
+            msg = (
+                f"Time range in {log_name}: "
+                f"{stats_mod.epoch_to_human(earliest)} to {stats_mod.epoch_to_human(latest)} "
+                f"({span_days:.1f} days)"
+            )
+            if span_days < 60:
+                msg += (
+                    f"\nCoverage is {span_days:.1f} days — INSUFFICIENT (need ≥20 days). "
+                    "Call list_pcap_files to see available date groups, then ingest_pcap "
+                    "for each uncovered group."
+                )
+            else:
+                msg += f"\nCoverage is adequate ({span_days:.1f} days ≥ 20). Proceed to Phase 2."
+            return msg
         except ValueError:
             return f"No valid timestamps found in {log_name}."
 
@@ -207,11 +278,38 @@ def build_micro_tools(
         # -- Ingestion tools (PCAP directory only) -------------------------
 
         if _is_pcap_dir:
+            _list_pcap_call_count = [0]
+
             @tool
             def list_pcap_files() -> str:
-                """List all PCAP files in the source directory with size and first-packet timestamp. Use this to survey available data before deciding which PCAPs to ingest."""
+                """List PCAP files grouped by date with ready-to-use ingest_pcap calls. Call this ONCE, then immediately call ingest_pcap for each group. Do NOT call this tool more than once."""
                 import struct
                 import datetime
+                import re as _re
+
+                _list_pcap_call_count[0] += 1
+                if _list_pcap_call_count[0] > 1:
+                    # Find first UNTRIED representative file to direct the agent
+                    pcaps_hint = sorted(
+                        p for p in _pcap_path.iterdir()
+                        if p.suffix in {".pcap", ".pcapng"}
+                    )
+                    seen: set[str] = set()
+                    reps = []
+                    for p in pcaps_hint:
+                        m = _re.search(r'-(\d{6})-', p.name)
+                        key = m.group(1) if m else p.name
+                        if key not in seen:
+                            seen.add(key)
+                            reps.append(p.name)
+                    untried = [f for f in reps if f not in _attempted_pcaps]
+                    next_file = untried[0] if untried else (reps[0] if reps else "the_first.pcap")
+                    return (
+                        f"ERROR: Do NOT call list_pcap_files again.\n"
+                        f"Already attempted: {_attempted_pcaps or 'none yet'}.\n"
+                        f"Call ingest_pcap NOW with the next untried file:\n"
+                        f'{{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{next_file}"}}}}'
+                    )
 
                 pcaps = sorted(
                     p for p in _pcap_path.iterdir()
@@ -220,28 +318,69 @@ def build_micro_tools(
                 if not pcaps:
                     return "No PCAP files found in the source directory."
 
-                lines = []
-                for p in pcaps:
-                    size_mb = p.stat().st_size / (1024 * 1024)
-                    # Read first-packet timestamp from PCAP header (24 byte global + 16 byte pkt)
-                    ts_str = "?"
+                def _read_ts(path):
                     try:
-                        with open(p, "rb") as fh:
-                            fh.read(24)  # skip global header
+                        with open(path, "rb") as fh:
+                            fh.read(24)
                             pkt_hdr = fh.read(16)
                             if len(pkt_hdr) >= 8:
                                 ts_sec = struct.unpack("<I", pkt_hdr[:4])[0]
-                                ts_str = datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M UTC")
+                                return datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M UTC")
                     except Exception:
                         pass
-                    lines.append(f"  {p.name}  ({size_mb:.0f} MB)  starts: {ts_str}")
+                    return "?"
 
-                return f"Found {len(pcaps)} PCAP file(s):\n" + "\n".join(lines)
+                # Group by the date portion in the filename (e.g. "250301")
+                groups: dict[str, list] = {}
+                for p in pcaps:
+                    m = _re.search(r'-(\d{6})-', p.name)
+                    key = m.group(1) if m else "unknown"
+                    groups.setdefault(key, []).append(p)
+
+                lines = [
+                    f"Found {len(pcaps)} PCAP file(s) in {len(groups)} date groups.",
+                    "WARNING: Call this tool only ONCE. Now call ingest_pcap for each group below.\n",
+                ]
+                for key in sorted(groups.keys()):
+                    grp = groups[key]
+                    first_ts = _read_ts(grp[0])
+                    last_ts = _read_ts(grp[-1])
+                    lines.append(
+                        f"Group {key} ({len(grp)} files): "
+                        f"incident time {first_ts} → {last_ts}"
+                    )
+                    lines.append(f"  Ingest: {grp[0].name}")
+
+                lines.append(
+                    "\nCall ingest_pcap for EACH group (one call per message):"
+                )
+                for key in sorted(groups.keys()):
+                    grp = groups[key]
+                    lines.append(
+                        f'  {{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{grp[0].name}"}}}}'
+                    )
+
+                result_str = "\n".join(lines)
+                print(f"  [list_pcap_files] {len(groups)} date groups: {sorted(groups.keys())}")
+                return result_str
 
             @tool
             def ingest_pcap(pcap_filename: str) -> str:
                 """Run Zeek on a specific PCAP file and merge its logs into the analysis directory. After ingestion, all Zeek log tools (grep_log, read_log_head, etc.) will see the new data. Each PCAP takes 1-3 minutes to process."""
+                import re as _re2
                 from .pcap_ingest import ingest_single_pcap
+
+                # Record this attempt regardless of outcome
+                if pcap_filename not in _attempted_pcaps:
+                    _attempted_pcaps.append(pcap_filename)
+
+                # If already successfully ingested, skip re-running Zeek
+                if pcap_filename in _successful_pcaps:
+                    return (
+                        f"{pcap_filename} was already ingested successfully. "
+                        "Call ingest_pcap with the NEXT date group file, "
+                        "or call list_available_logs to see current logs."
+                    )
 
                 target = _pcap_path / pcap_filename
                 if not target.exists():
@@ -249,18 +388,63 @@ def build_micro_tools(
                     hint = ", ".join(avail[:5])
                     return f"Error: '{pcap_filename}' not found. Available: {hint}..."
 
+                # Find next untried representative to suggest on failure
+                all_pcaps = sorted(p.name for p in _pcap_path.iterdir() if p.suffix in {".pcap", ".pcapng"})
+                seen_g: set[str] = set()
+                reps: list[str] = []
+                for name in all_pcaps:
+                    m = _re2.search(r'-(\d{6})-', name)
+                    key = m.group(1) if m else name
+                    if key not in seen_g:
+                        seen_g.add(key)
+                        reps.append(name)
+                untried = [f for f in reps if f not in _attempted_pcaps]
+                next_hint = (
+                    f'\nNext: {{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{untried[0]}"}}}}'
+                    if untried else "\nAll date groups have been attempted."
+                )
+
                 try:
-                    print(f"  [TOOL] Ingesting {pcap_filename} via Zeek ...")
+                    import re as _re3
+                    _grp_m = _re3.search(r'-(\d{6})-', pcap_filename)
+                    _grp_key = _grp_m.group(1) if _grp_m else "unknown"
+                    print(f"  [INGEST] Starting: {pcap_filename} (date group {_grp_key}) ...")
                     stats = ingest_single_pcap(str(target), log_dir)
                     if not stats:
-                        return f"Zeek processed {pcap_filename} but produced no log output."
-                    lines = [f"Successfully ingested {pcap_filename}. New records:"]
+                        print(f"  [INGEST] No output: {pcap_filename}")
+                        return (
+                            f"Zeek ran on {pcap_filename} but produced no log records. "
+                            f"This PCAP may be empty or contain only unrecognised traffic.{next_hint}"
+                        )
+                    _successful_pcaps.append(pcap_filename)
+                    total_records = sum(stats.values())
+                    top_logs = sorted(stats.items(), key=lambda x: -x[1])[:5]
+                    print(f"  [INGEST] Done: {pcap_filename} → {total_records:,} records across {len(stats)} logs")
+                    # Append to persistent ingestion log alongside the report output
+                    try:
+                        import datetime as _dt
+                        _ingest_log = Path(log_dir).parent / "ingested_pcaps.log"
+                        with open(_ingest_log, "a", encoding="utf-8") as _lf:
+                            _ts = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                            _lf.write(f"{_ts}  {pcap_filename}  ({total_records:,} records)\n")
+                    except Exception:
+                        pass
+                    for _ln, _cnt in top_logs:
+                        print(f"    {_ln}: +{_cnt:,}")
+                    lines = [
+                        f"Successfully ingested {pcap_filename} (group {_grp_key}). "
+                        f"{total_records:,} new records across {len(stats)} log types."
+                    ]
                     for log_name, count in sorted(stats.items()):
                         lines.append(f"  {log_name}: +{count} records")
-                    lines.append("Use list_available_logs to see the updated log inventory.")
+                    lines.append(
+                        f"Ingested so far: {len(_successful_pcaps)} group(s). "
+                        f"Remaining: {len(untried)} group(s) not yet ingested.{next_hint}"
+                    )
                     return "\n".join(lines)
                 except Exception as e:
-                    return f"Ingestion failed for {pcap_filename}: {e}"
+                    print(f"  [INGEST] ERROR: {pcap_filename}: {e}")
+                    return f"Ingestion failed for {pcap_filename}: {e}{next_hint}"
 
             tools.extend([list_pcap_files, ingest_pcap])
 

@@ -70,7 +70,7 @@ class Config:
     llm_temperature: float = 0.1
 
     # --- Agent ---
-    max_iterations: int = 50
+    max_iterations: int = 200
     human_review: bool = False
 
     # --- Cost tracking ---

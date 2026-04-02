@@ -156,7 +156,26 @@ def report_node(state: ForensicState) -> dict:
             SystemMessage(content=FORENSIC_SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ])
-        executive_summary = response.content
+        import re as _re
+        raw = response.content or ""
+
+        # Strip <think>...</think> tags (matched pair or orphaned closing tag)
+        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL)
+        if "</think>" in cleaned:
+            cleaned = cleaned[cleaned.index("</think>") + len("</think>"):]
+        cleaned = cleaned.replace("<think>", "").strip()
+
+        # Some models output "Thinking Process:" or numbered planning sections
+        # before the actual answer. The real content starts at the first
+        # recognised section header we requested: **Incident Overview
+        markers = ["**Incident Overview", "**Root Cause", "**Impact Scope", "**Key Timeline"]
+        for marker in markers:
+            idx = cleaned.find(marker)
+            if idx != -1:
+                cleaned = cleaned[idx:].strip()
+                break
+
+        executive_summary = cleaned or raw
 
         # Record token accounting for the report LLM call.
         input_tokens, output_tokens = _extract_usage_tokens(response)

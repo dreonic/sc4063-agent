@@ -24,8 +24,28 @@ from ..tools.state_tools import build_state_tools
 
 MAX_TOOL_RESULT_CHARS = 8000
 MAX_NOTE_CHARS = 500
-MAX_CONTEXT_MESSAGES = 60
-CHARS_PER_TOKEN_ESTIMATE = 4
+MAX_CONTEXT_MESSAGES = 120
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> chain-of-thought blocks from model output.
+
+    Handles three patterns emitted by Qwen/DeepSeek-R1 style models:
+    1. Full <think>...</think> block — remove the block entirely.
+    2. Orphaned </think> only (reasoning has no opening tag) — strip
+       everything up to and including </think>, keeping what follows.
+    3. Orphaned <think> only — remove the tag.
+    """
+    if not text:
+        return text
+    # Pattern 1: matched pair
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Pattern 2: orphaned closing tag — drop all content before it
+    if "</think>" in cleaned:
+        cleaned = cleaned[cleaned.index("</think>") + len("</think>"):]
+    # Pattern 3: orphaned opening tag
+    cleaned = cleaned.replace("<think>", "")
+    return cleaned.strip()
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -43,121 +63,23 @@ def _truncate_text(text: str, max_chars: int) -> str:
     )
 
 
-def _trim_message_history(messages: list):
+def _trim_message_history(messages: list, progress_summary: str = ""):
     """Preserve core prompt and recent turns while trimming old context."""
     if len(messages) <= (MAX_CONTEXT_MESSAGES + 2):
         return messages
 
-    from langchain_core.messages import SystemMessage
+    from langchain_core.messages import HumanMessage
 
     original_len = len(messages)
     trimmed = messages[:2] + messages[-MAX_CONTEXT_MESSAGES:]
-    trimmed.insert(
-        2,
-        SystemMessage(
-            content=(
-                f"Conversation history was truncated to keep prompt size within "
-                f"model context. Kept latest {MAX_CONTEXT_MESSAGES} messages out "
-                f"of {original_len}."
-            )
-        ),
+    summary_text = (
+        f"[Context trimmed: kept latest {MAX_CONTEXT_MESSAGES} of "
+        f"{original_len} messages. Continue investigation from where you left off.]"
     )
+    if progress_summary:
+        summary_text += f"\n\n[PROGRESS SUMMARY — do NOT redo completed steps]\n{progress_summary}"
+    trimmed.insert(2, HumanMessage(content=summary_text))
     return trimmed
-
-
-def _estimate_tokens_from_text(text: str) -> int:
-    """Approximate token count when provider metadata is unavailable."""
-    if not text:
-        return 0
-    return max(1, (len(text) + CHARS_PER_TOKEN_ESTIMATE - 1) // CHARS_PER_TOKEN_ESTIMATE)
-
-
-def _stringify_message_content(content) -> str:
-    """Normalize message content into plain text for token estimation."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                if "text" in item:
-                    parts.append(str(item.get("text", "")))
-                elif "content" in item:
-                    parts.append(str(item.get("content", "")))
-                else:
-                    parts.append(json.dumps(item, default=str))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
-    return str(content)
-
-
-def _estimate_input_tokens(messages: list) -> int:
-    """Estimate input tokens for the current prompt window."""
-    total = 0
-    for msg in messages:
-        total += _estimate_tokens_from_text(
-            _stringify_message_content(getattr(msg, "content", ""))
-        )
-        tool_calls = getattr(msg, "tool_calls", None)
-        if tool_calls:
-            total += _estimate_tokens_from_text(json.dumps(tool_calls, default=str))
-    return total
-
-
-def _extract_usage_tokens(response) -> tuple[int, int]:
-    """Extract input/output token counts across different provider schemas."""
-    usage_candidates: list[dict] = []
-
-    usage = getattr(response, "usage_metadata", None)
-    if isinstance(usage, dict):
-        usage_candidates.append(usage)
-
-    response_metadata = getattr(response, "response_metadata", None)
-    if isinstance(response_metadata, dict):
-        for key in ("token_usage", "usage", "usage_metadata"):
-            value = response_metadata.get(key)
-            if isinstance(value, dict):
-                usage_candidates.append(value)
-
-    additional_kwargs = getattr(response, "additional_kwargs", None)
-    if isinstance(additional_kwargs, dict):
-        for key in ("token_usage", "usage"):
-            value = additional_kwargs.get(key)
-            if isinstance(value, dict):
-                usage_candidates.append(value)
-
-    for candidate in usage_candidates:
-        input_tokens = candidate.get("input_tokens")
-        if input_tokens is None:
-            input_tokens = candidate.get("prompt_tokens")
-        if input_tokens is None:
-            input_tokens = candidate.get("input_token_count")
-        if input_tokens is None:
-            input_tokens = candidate.get("prompt_token_count")
-
-        output_tokens = candidate.get("output_tokens")
-        if output_tokens is None:
-            output_tokens = candidate.get("completion_tokens")
-        if output_tokens is None:
-            output_tokens = candidate.get("output_token_count")
-        if output_tokens is None:
-            output_tokens = candidate.get("completion_token_count")
-
-        try:
-            in_tok = int(input_tokens or 0)
-            out_tok = int(output_tokens or 0)
-        except (TypeError, ValueError):
-            continue
-
-        if in_tok > 0 or out_tok > 0:
-            return in_tok, out_tok
-
-    return 0, 0
 
 
 def _format_tool_catalog(tools: list) -> str:
@@ -189,6 +111,16 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
     stripped = content.strip()
     if stripped.startswith("{") or stripped.startswith("["):
         candidates.append(stripped)
+
+    # Third: JSON objects embedded in prose after reasoning text.
+    # Models like Qwen output reasoning WITHOUT <think> tags, then emit
+    # {"name":...} blocks. Find the first occurrence and take everything
+    # from there to the end of the string.
+    m = re.search(r'(?:^|\n)({"name"\s*:)', content)
+    if m:
+        json_block = content[m.start(1):].strip()
+        if json_block not in candidates:
+            candidates.append(json_block)
 
     parsed_calls: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -298,6 +230,39 @@ def _format_hosts(hosts: list[dict]) -> str:
     return "\n".join(lines) if lines else "  (no hosts discovered)"
 
 
+def _pick_representative_pcaps(pcap_dir: Path) -> list[str]:
+    """Select one PCAP per date group in the filename (e.g. "250301", "250302" …).
+
+    Filenames follow the pattern ``34936-sensor-YYMMDD-NNNNN_redacted.pcap``.
+    Selecting the first file from each date group gives maximum temporal diversity.
+    Falls back to evenly-spaced selection if no date pattern is found.
+    """
+    import re as _re
+
+    pcaps = sorted(
+        p.name for p in pcap_dir.iterdir()
+        if p.suffix in (".pcap", ".pcapng")
+    )
+    if not pcaps:
+        return []
+
+    seen: set[str] = set()
+    representatives: list[str] = []
+    for name in pcaps:
+        m = _re.search(r'-(\d{6})-', name)
+        key = m.group(1) if m else name
+        if key not in seen:
+            seen.add(key)
+            representatives.append(name)
+
+    # Fallback: if no date pattern matched at all, use evenly-spaced
+    if len(representatives) == len(pcaps) and len(pcaps) > 9:
+        step = (len(pcaps) - 1) / 8
+        representatives = [pcaps[round(i * step)] for i in range(9)]
+
+    return representatives
+
+
 def investigate_node(state: ForensicState) -> dict:
     """Run the autonomous ReAct investigation agent.
 
@@ -306,11 +271,17 @@ def investigate_node(state: ForensicState) -> dict:
     iteration cap.
     """
     config = Config()
+    # Derive /metrics URL from LLM base URL (strip /v1 suffix if present)
+    _metrics_base = config.llm_base_url.rstrip("/")
+    if _metrics_base.endswith("/v1"):
+        _metrics_base = _metrics_base[:-3]
+    _metrics_url = _metrics_base + "/metrics"
     tracker = HybridCostTracker(
         api_input_cost_per_1k=config.api_input_cost_per_1k,
         api_output_cost_per_1k=config.api_output_cost_per_1k,
         gpu_hourly_rate=config.gpu_hourly_rate,
         gpu_description=f"Local GPU @ ${config.gpu_hourly_rate:.2f}/hr",
+        metrics_url=_metrics_url,
     )
     tracker.start()
     tracker.start_phase("investigate")
@@ -349,27 +320,41 @@ def investigate_node(state: ForensicState) -> dict:
 
     # Build context-enriched system prompt
     pcap_note = ""
+    _representative_pcaps: list[str] = []
     if pcap_path and Path(pcap_path).is_dir():
-        pcap_count = sum(
-            1 for p in Path(pcap_path).iterdir()
-            if p.suffix in (".pcap", ".pcapng")
-        )
-        pcap_note = (
-            f"\n\n## PCAP SOURCE DIRECTORY"
-            f"\nA directory of {pcap_count} PCAP file(s) is available."
-            f"\n\n**PCAP Ingestion Strategy:**"
-            f"\n1. Call `list_pcap_files` to see all PCAPs with timestamps and sizes."
-            f"\n2. Call `ingest_pcap(filename)` to run Zeek on a specific PCAP — this "
-            f"creates/updates Zeek logs in the analysis directory (takes 1-3 min per file)."
-            f"\n3. After ingestion, use Zeek log tools (grep_log, read_log_head, "
-            f"count_by_field, etc.) and macro analysis tools on the resulting logs."
-            f"\n4. Ingest additional PCAPs as needed to expand the investigation window."
-            f"\n\nYou can also use tshark DPI tools (list_pcap_protocols, apply_bpf_filter, "
-            f"extract_pcap_stream, get_packet_details, extract_http_objects) directly on "
-            f"any PCAP file by specifying pcap_file=<filename>."
-            f"\n\nStart by listing PCAPs and ingesting a few to get initial Zeek logs. "
-            f"Then analyze and decide whether to ingest more."
-        )
+        pcap_dir = Path(pcap_path)
+        pcap_count = sum(1 for p in pcap_dir.iterdir() if p.suffix in (".pcap", ".pcapng"))
+        _representative_pcaps = _pick_representative_pcaps(pcap_dir)
+        print(f"[INVESTIGATE] PCAP directory: {pcap_count} files, {len(_representative_pcaps)} date groups selected:")
+        for _i, _f in enumerate(_representative_pcaps, 1):
+            print(f"  Group {_i}: {_f}")
+        rep_list = "\n".join(f"  {i+1}. {f}" for i, f in enumerate(_representative_pcaps))
+        has_logs = bool(inventory)
+        if has_logs:
+            pcap_note = (
+                f"\n\n## PCAP SOURCE DIRECTORY"
+                f"\nA directory of {pcap_count} PCAP file(s) is available. "
+                f"Zeek logs exist but coverage may be incomplete."
+                f"\n\nFollow Phase 1 in the system prompt: call `get_time_range` on conn.log "
+                f"to check coverage. If span < 20 days, call `list_pcap_files` then "
+                f"ingest additional PCAPs from the underrepresented date groups."
+                f"\n\nFallback filenames (one per date group) if `list_pcap_files` is unavailable:"
+                f"\n{rep_list}"
+                f"\n\nYou can also use tshark DPI tools (list_pcap_protocols, apply_bpf_filter, "
+                f"extract_pcap_stream, get_packet_details, extract_http_objects) on any PCAP "
+                f"file by specifying pcap_file=<filename>."
+            )
+        else:
+            pcap_note = (
+                f"\n\n## PCAP SOURCE DIRECTORY — NO ZEEK LOGS YET"
+                f"\nA directory of {pcap_count} PCAP file(s) is available. "
+                f"The Zeek log directory is currently EMPTY."
+                f"\n\nStart by calling `list_pcap_files` to see the available PCAPs "
+                f"grouped by date — it will show you exactly which `ingest_pcap` calls "
+                f"to make. Then call `ingest_pcap` for one file per date group."
+                f"\n\nFallback: if you already know filenames, call `ingest_pcap` directly:"
+                f"\n{rep_list}"
+            )
     elif pcap_path and Path(pcap_path).is_file():
         pcap_note = (
             "\n\nA single PCAP file is available. You can use tshark deep packet inspection "
@@ -380,6 +365,19 @@ def investigate_node(state: ForensicState) -> dict:
         pcap_note = (
             "\n\nNo PCAP file is available — only Zeek logs. "
             "The tshark DPI tools are not available for this analysis."
+        )
+
+    # Pre-built nudge text for loop-detection recovery
+    _ingest_nudge_text = ""
+    if _representative_pcaps:
+        first_pcap = _representative_pcaps[0]
+        _ingest_nudge_text = (
+            f"You have already called list_pcap_files. Stop calling it again.\n"
+            f"You need to call ingest_pcap for each of the {len(_representative_pcaps)} "
+            f"date groups to cover the full incident window.\n"
+            f"Start NOW with this call (output only the JSON, no prose):\n"
+            f'{{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{first_pcap}"}}}}\n'
+            f"Then continue with the remaining groups one call at a time."
         )
 
     system_prompt = (
@@ -413,7 +411,12 @@ def investigate_node(state: ForensicState) -> dict:
     tool_map = {t.name: t for t in all_tools}
 
     iteration = 0
-    token_estimate_notice_logged = False
+    # Rolling window of the last 6 tool names — used for loop detection
+    _recent_tool_names: list[str] = []
+    # Session-level tracking of PCAP ingestion (mirrors what the tool closure tracks,
+    # but accessible here without fragile closure introspection)
+    _ingested_pcaps: set[str] = set()
+    _macros_run: set[str] = set()
     print(f"[INVESTIGATE] Starting autonomous ReAct investigation (max {max_iterations} iterations)...")
 
     while iteration < max_iterations and not state_ref["investigation_complete"]:
@@ -422,7 +425,6 @@ def investigate_node(state: ForensicState) -> dict:
 
         # Get LLM response
         # Get LLM response (streaming to console)
-        estimated_input_tokens = _estimate_input_tokens(messages)
         try:
             response = None
             print("    Agent thought:\n", end="", flush=True)
@@ -440,51 +442,85 @@ def investigate_node(state: ForensicState) -> dict:
             break
 
         # Record token usage (langchain-openai populates usage_metadata)
-        input_tokens, output_tokens = _extract_usage_tokens(response)
-        if input_tokens == 0 and output_tokens == 0:
-            input_tokens = estimated_input_tokens
-            output_tokens = _estimate_tokens_from_text(
-                _stringify_message_content(getattr(response, "content", ""))
-            )
-            response_tool_calls = getattr(response, "tool_calls", None)
-            if response_tool_calls:
-                output_tokens += _estimate_tokens_from_text(
-                    json.dumps(response_tool_calls, default=str)
-                )
-            if not token_estimate_notice_logged:
-                print("    Note: Provider token metadata missing; using estimated token counts.")
-                token_estimate_notice_logged = True
-
+        usage = getattr(response, "usage_metadata", None) or {}
         tracker.record_llm_call(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
         )
 
         messages.append(response)
 
-        # Log reasoning to notes
-        if response.content:
-            note = response.content[:MAX_NOTE_CHARS]
-            state_ref["investigation_notes"].append(f"[Step {iteration}] {note}")
+        raw_content = response.content or ""
 
-        # Check for tool calls
+        # Strip <think>...</think> chain-of-thought. For models that put
+        # their reasoning AND planned actions inside <think>, also try the
+        # raw text — tool JSON may be embedded inside the think block.
+        visible_content = _strip_thinking(raw_content)
+
+        # Log a brief note (prefer stripped, fall back to raw snippet)
+        note_text = visible_content or raw_content
+        if note_text:
+            state_ref["investigation_notes"].append(
+                f"[Step {iteration}] {note_text[:MAX_NOTE_CHARS]}"
+            )
+
+        # Check for tool calls: native → stripped text → raw text
         if not response.tool_calls:
-            response.tool_calls = _extract_tool_calls_from_text(response.content)
+            response.tool_calls = _extract_tool_calls_from_text(visible_content)
+        if not response.tool_calls and visible_content != raw_content:
+            # Some models embed JSON inside <think>; try the full raw text
+            response.tool_calls = _extract_tool_calls_from_text(raw_content)
 
         if not response.tool_calls:
             state_ref["investigation_notes"].append(
                 f"[Step {iteration}] Agent reasoned but did not call a tool."
             )
-            # Nudge the agent instead of aborting the whole investigation
-            from langchain_core.messages import SystemMessage
-            valid_tools = ", ".join(sorted(tool_map.keys()))
-            nudge = SystemMessage(content=(
-                "You provided reasoning but no tools were invoked. "
-                "Do NOT output shell commands or explanatory prose. "
-                "Invoke one or more tools now using valid tool names and valid args only. "
-                "If complete, call 'mark_investigation_complete'. "
-                f"Valid tools: {valid_tools}"
-            ))
+            from langchain_core.messages import HumanMessage as _HumanMessage
+
+            # Detect completion-ready pattern: agent describes having finished all
+            # tasks but doesn't emit the tool call.
+            # IMPORTANT: check only the visible (non-thinking) content to avoid
+            # triggering on the model reasoning *about* mark_investigation_complete
+            # while deciding it's not ready yet. Also gate on minimum work done.
+            _macro_tools = {"run_initial_access_analysis", "run_lateral_movement_analysis",
+                            "run_exfiltration_analysis", "run_payload_analysis"}
+            _macros_called = len(_macro_tools & set(_recent_tool_names))
+            _enough_work = tracker.total_tool_invocations >= 12 and _macros_called >= 2
+
+            combined = (visible_content or "").lower()
+            completion_signals = [
+                "all phase 3 tasks",
+                "all tasks complete",
+                "i've completed all",
+                "completed all phase",
+                "phase 3 is complete",
+                "completed the investigation",
+            ]
+            is_completion_ready = _enough_work and any(sig in combined for sig in completion_signals)
+
+            if is_completion_ready:
+                nudge = _HumanMessage(content=(
+                    'Output exactly this and nothing else:\n'
+                    '{"name": "mark_investigation_complete", "arguments": {}}'
+                ))
+            elif _representative_pcaps and _recent_tool_names and _recent_tool_names[-1] == "list_pcap_files":
+                # Model called list_pcap_files but didn't follow through to ingest_pcap.
+                _next_file = next((f for f in _representative_pcaps if f not in _ingested_pcaps), _representative_pcaps[0])
+                nudge = _HumanMessage(content=(
+                    f"You called list_pcap_files. Now you MUST call ingest_pcap.\n"
+                    f"Output only this JSON, nothing else:\n"
+                    f'{{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{_next_file}"}}}}'
+                ))
+            else:
+                valid_tools = ", ".join(sorted(tool_map.keys()))
+                nudge = _HumanMessage(content=(
+                    "Output a JSON tool call now. No <think> tags, no prose. "
+                    "Put the JSON directly with no other text. Example:\n"
+                    '{"name": "record_ioc", "arguments": {"ioc_type": "ip", "value": "1.2.3.4", "context": "Primary attacker", "source_phase": "initial_access"}}\n'
+                    "If investigation is complete, output:\n"
+                    '{"name": "mark_investigation_complete", "arguments": {}}\n'
+                    f"Valid tools: {valid_tools}"
+                ))
             messages.append(nudge)
             continue
 
@@ -498,6 +534,11 @@ def investigate_node(state: ForensicState) -> dict:
                 tool_args = {}
 
             print(f"    Tool: {tool_name}({', '.join(f'{k}={repr(v)[:40]}' for k, v in tool_args.items())})")
+
+            # Track recent tool calls for loop detection
+            _recent_tool_names.append(tool_name)
+            if len(_recent_tool_names) > 6:
+                _recent_tool_names.pop(0)
 
             tracker.record_tool_invocation()
             if tool_name in tool_map:
@@ -518,8 +559,82 @@ def investigate_node(state: ForensicState) -> dict:
             tool_output = _truncate_text(str(result), MAX_TOOL_RESULT_CHARS)
             messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call["id"]))
 
-        # Keep message history bounded across long investigations.
-        messages = _trim_message_history(messages)
+            # Track session-level progress
+            if tool_name == "ingest_pcap" and "Successfully ingested" in tool_output:
+                _ingested_pcaps.add(tool_args.get("pcap_filename", ""))
+            if tool_name in {"run_initial_access_analysis", "run_lateral_movement_analysis",
+                             "run_exfiltration_analysis", "run_payload_analysis"}:
+                _macros_run.add(tool_name)
+
+        # Keep message history bounded. Inject a progress summary so the model
+        # retains awareness of completed work after context trimming.
+        _progress_parts = []
+        if _ingested_pcaps:
+            _progress_parts.append(
+                f"PCAPs successfully ingested ({len(_ingested_pcaps)}): "
+                + ", ".join(sorted(_ingested_pcaps))
+            )
+        if _macros_run:
+            _progress_parts.append(f"Macro analysis tools completed: {', '.join(sorted(_macros_run))}")
+        if state_ref["findings"]:
+            _progress_parts.append(f"Findings recorded: {len(state_ref['findings'])}")
+        if state_ref["iocs"]:
+            _progress_parts.append(f"IOCs recorded: {len(state_ref['iocs'])}")
+        _progress_summary = "\n".join(_progress_parts)
+        messages = _trim_message_history(messages, _progress_summary)
+
+        # Loop detection: repeated tool calls without progress.
+        # list_pcap_files loop: called >= 2 times without ingest_pcap
+        if (
+            _ingest_nudge_text
+            and _recent_tool_names.count("list_pcap_files") >= 2
+            and "ingest_pcap" not in _recent_tool_names
+        ):
+            from langchain_core.messages import HumanMessage as _HM
+            print("    [LOOP DETECTED] list_pcap_files called repeatedly without ingest — injecting nudge")
+            messages.append(_HM(content=_ingest_nudge_text))
+            _recent_tool_names.clear()
+
+        # get_time_range loop: called >= 2 times without acting on the result
+        elif (
+            _representative_pcaps
+            and _recent_tool_names.count("get_time_range") >= 2
+            and "ingest_pcap" not in _recent_tool_names
+            and "list_pcap_files" not in _recent_tool_names
+        ):
+            from langchain_core.messages import HumanMessage as _HM
+            print("    [LOOP DETECTED] get_time_range called repeatedly — injecting nudge")
+            _untried = [f for f in _representative_pcaps if f not in _ingested_pcaps]
+            if _untried:
+                # Coverage still inadequate — push toward ingestion
+                _next_file = _untried[0]
+                messages.append(_HM(content=(
+                    f"STOP calling get_time_range. Coverage check is done.\n"
+                    f"You still have {len(_untried)} date group(s) to ingest. "
+                    f"Call ingest_pcap now:\n"
+                    f'{{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{_next_file}"}}}}'
+                )))
+            else:
+                # All groups ingested — coverage is as good as it gets, move on
+                messages.append(_HM(content=(
+                    "STOP calling get_time_range. All date groups have been ingested. "
+                    "Coverage is adequate for this dataset. "
+                    "Proceed to Phase 2 macro analysis NOW:\n"
+                    '{"name": "run_initial_access_analysis", "arguments": {}}'
+                )))
+            _recent_tool_names.clear()
+
+        # record_timeline_event / record_ioc loop: pure recording with no analysis
+        elif _recent_tool_names.count("record_timeline_event") >= 3:
+            from langchain_core.messages import HumanMessage as _HM
+            print("    [LOOP DETECTED] record_timeline_event spam — nudging toward completion")
+            messages.append(_HM(content=(
+                "STOP recording timeline events. You have recorded enough.\n"
+                "If all Phase 3 tasks are complete, call mark_investigation_complete now:\n"
+                '{"name": "mark_investigation_complete", "arguments": {}}\n'
+                "If Phase 3 tasks remain, call the next required micro tool instead."
+            )))
+            _recent_tool_names.clear()
 
     if iteration >= max_iterations and not state_ref["investigation_complete"]:
         print(f"  [INVESTIGATE] Hit iteration cap ({max_iterations}). Proceeding to correlation.")
@@ -529,6 +644,15 @@ def investigate_node(state: ForensicState) -> dict:
 
     print(f"[INVESTIGATE] Complete: {len(state_ref['findings'])} findings, "
           f"{len(state_ref['iocs'])} IOCs, {len(state_ref['timeline_events'])} timeline events")
+    if _ingested_pcaps:
+        print(f"[INVESTIGATE] PCAPs ingested this session ({len(_ingested_pcaps)}/{len(_representative_pcaps)} groups):")
+        for _f in sorted(_ingested_pcaps):
+            print(f"  + {_f}")
+    not_ingested = [f for f in _representative_pcaps if f not in _ingested_pcaps]
+    if not_ingested:
+        print(f"[INVESTIGATE] WARNING: {len(not_ingested)} date group(s) NOT ingested:")
+        for _f in not_ingested:
+            print(f"  - {_f}")
 
     tracker.stop()
     cost_metrics = tracker.get_metrics()
