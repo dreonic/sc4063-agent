@@ -190,7 +190,29 @@ def main() -> None:
         sys.exit(1)
 
     tracker.stop()
-    metrics = tracker.get_metrics()
+    live_metrics = tracker.get_metrics()
+    state_metrics = final_state.get("cost_metrics", {}) if isinstance(final_state, dict) else {}
+
+    metrics = dict(live_metrics)
+    if isinstance(state_metrics, dict) and state_metrics:
+        metrics.update(state_metrics)
+
+    # Ensure key values exist for CLI printouts.
+    metrics.setdefault("total_llm_calls", 0)
+    metrics.setdefault("total_tool_invocations", 0)
+    metrics.setdefault("total_input_tokens", 0)
+    metrics.setdefault("total_output_tokens", 0)
+    metrics.setdefault("wall_clock_formatted", live_metrics.get("wall_clock_formatted", "N/A"))
+    metrics.setdefault("gpu_description", live_metrics.get("gpu_description", "Local GPU"))
+
+    # Recompute API cost from tokens to keep CLI and report aligned.
+    metrics["api_cost"] = round(
+        (int(metrics.get("total_input_tokens", 0)) / 1000) * config.api_input_cost_per_1k
+        + (int(metrics.get("total_output_tokens", 0)) / 1000) * config.api_output_cost_per_1k,
+        4,
+    )
+    if "gpu_cost" not in metrics:
+        metrics["gpu_cost"] = live_metrics.get("gpu_cost", 0.0)
 
     # Print cost summary
     print()

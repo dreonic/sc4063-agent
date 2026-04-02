@@ -6,6 +6,11 @@ No human interrupts occur within this loop.
 """
 from __future__ import annotations
 
+import json
+import re
+import uuid
+from pathlib import Path
+
 from langchain_openai import ChatOpenAI
 
 from ..config import Config
@@ -19,7 +24,8 @@ from ..tools.state_tools import build_state_tools
 
 MAX_TOOL_RESULT_CHARS = 8000
 MAX_NOTE_CHARS = 500
-MAX_CONTEXT_MESSAGES = 28
+MAX_CONTEXT_MESSAGES = 60
+CHARS_PER_TOKEN_ESTIMATE = 4
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -57,6 +63,203 @@ def _trim_message_history(messages: list):
         ),
     )
     return trimmed
+
+
+def _estimate_tokens_from_text(text: str) -> int:
+    """Approximate token count when provider metadata is unavailable."""
+    if not text:
+        return 0
+    return max(1, (len(text) + CHARS_PER_TOKEN_ESTIMATE - 1) // CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _stringify_message_content(content) -> str:
+    """Normalize message content into plain text for token estimation."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item.get("text", "")))
+                elif "content" in item:
+                    parts.append(str(item.get("content", "")))
+                else:
+                    parts.append(json.dumps(item, default=str))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _estimate_input_tokens(messages: list) -> int:
+    """Estimate input tokens for the current prompt window."""
+    total = 0
+    for msg in messages:
+        total += _estimate_tokens_from_text(
+            _stringify_message_content(getattr(msg, "content", ""))
+        )
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            total += _estimate_tokens_from_text(json.dumps(tool_calls, default=str))
+    return total
+
+
+def _extract_usage_tokens(response) -> tuple[int, int]:
+    """Extract input/output token counts across different provider schemas."""
+    usage_candidates: list[dict] = []
+
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, dict):
+        usage_candidates.append(usage)
+
+    response_metadata = getattr(response, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        for key in ("token_usage", "usage", "usage_metadata"):
+            value = response_metadata.get(key)
+            if isinstance(value, dict):
+                usage_candidates.append(value)
+
+    additional_kwargs = getattr(response, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        for key in ("token_usage", "usage"):
+            value = additional_kwargs.get(key)
+            if isinstance(value, dict):
+                usage_candidates.append(value)
+
+    for candidate in usage_candidates:
+        input_tokens = candidate.get("input_tokens")
+        if input_tokens is None:
+            input_tokens = candidate.get("prompt_tokens")
+        if input_tokens is None:
+            input_tokens = candidate.get("input_token_count")
+        if input_tokens is None:
+            input_tokens = candidate.get("prompt_token_count")
+
+        output_tokens = candidate.get("output_tokens")
+        if output_tokens is None:
+            output_tokens = candidate.get("completion_tokens")
+        if output_tokens is None:
+            output_tokens = candidate.get("output_token_count")
+        if output_tokens is None:
+            output_tokens = candidate.get("completion_token_count")
+
+        try:
+            in_tok = int(input_tokens or 0)
+            out_tok = int(output_tokens or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if in_tok > 0 or out_tok > 0:
+            return in_tok, out_tok
+
+    return 0, 0
+
+
+def _format_tool_catalog(tools: list) -> str:
+    """Render available tools and accepted argument names for the prompt."""
+    lines = []
+    for t in tools:
+        arg_schema = getattr(t, "args", None)
+        arg_names = []
+        if isinstance(arg_schema, dict):
+            arg_names = [str(k) for k in arg_schema.keys()]
+        arg_text = ", ".join(arg_names) if arg_names else "no arguments"
+        lines.append(f"  - {t.name}({arg_text})")
+    return "\n".join(lines) if lines else "  (no tools available)"
+
+
+def _extract_tool_calls_from_text(content: str) -> list[dict]:
+    """Parse tool calls from model text when native tool_call parsing fails.
+
+    Supports both a single JSON object and a JSON array of objects, with keys
+    ``args`` or ``arguments``.
+    """
+    if not content:
+        return []
+
+    candidates: list[str] = []
+    for block in re.findall(r"```(?:json)?\n(.*?)\n```", content, re.DOTALL):
+        candidates.append(block.strip())
+
+    stripped = content.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        candidates.append(stripped)
+
+    parsed_calls: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for candidate in candidates:
+        payload = None
+        # First try: parse as-is (single object or array)
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            pass
+
+        # Second try: multiple top-level objects in one block (no array brackets)
+        # e.g. {"name":"foo"}\n{"name":"bar"} — auto-wrap as array
+        if payload is None:
+            wrapped = re.sub(r'}\s*\n\s*{', '},{', candidate)
+            if not wrapped.startswith('['):
+                wrapped = f'[{wrapped}]'
+            try:
+                payload = json.loads(wrapped)
+            except Exception:
+                pass
+
+        if payload is None:
+            continue
+
+        raw_calls = payload if isinstance(payload, list) else [payload]
+        for raw in raw_calls:
+            if not isinstance(raw, dict) or "name" not in raw:
+                continue
+
+            args = raw.get("arguments", raw.get("args", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            name = str(raw.get("name", "")).strip()
+            if not name:
+                continue
+
+            key = (name, json.dumps(args, sort_keys=True, default=str))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            parsed_calls.append({
+                "name": name,
+                "args": args,
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+            })
+
+    return parsed_calls
+
+
+def _sanitize_tool_args(tool_obj, raw_args: dict) -> tuple[dict, list[str]]:
+    """Drop unsupported arguments so near-miss tool calls can still execute."""
+    if not isinstance(raw_args, dict):
+        return {}, []
+
+    schema = getattr(tool_obj, "args", None)
+    if not isinstance(schema, dict) or not schema:
+        return raw_args, []
+
+    allowed = set(schema.keys())
+    sanitized = {k: v for k, v in raw_args.items() if k in allowed}
+    dropped = [k for k in raw_args.keys() if k not in allowed]
+    return sanitized, dropped
 
 
 def _format_inventory(inventory: list[dict]) -> str:
@@ -146,9 +349,30 @@ def investigate_node(state: ForensicState) -> dict:
 
     # Build context-enriched system prompt
     pcap_note = ""
-    if pcap_path:
+    if pcap_path and Path(pcap_path).is_dir():
+        pcap_count = sum(
+            1 for p in Path(pcap_path).iterdir()
+            if p.suffix in (".pcap", ".pcapng")
+        )
         pcap_note = (
-            "\n\nA PCAP file is available. You can use tshark deep packet inspection "
+            f"\n\n## PCAP SOURCE DIRECTORY"
+            f"\nA directory of {pcap_count} PCAP file(s) is available."
+            f"\n\n**PCAP Ingestion Strategy:**"
+            f"\n1. Call `list_pcap_files` to see all PCAPs with timestamps and sizes."
+            f"\n2. Call `ingest_pcap(filename)` to run Zeek on a specific PCAP — this "
+            f"creates/updates Zeek logs in the analysis directory (takes 1-3 min per file)."
+            f"\n3. After ingestion, use Zeek log tools (grep_log, read_log_head, "
+            f"count_by_field, etc.) and macro analysis tools on the resulting logs."
+            f"\n4. Ingest additional PCAPs as needed to expand the investigation window."
+            f"\n\nYou can also use tshark DPI tools (list_pcap_protocols, apply_bpf_filter, "
+            f"extract_pcap_stream, get_packet_details, extract_http_objects) directly on "
+            f"any PCAP file by specifying pcap_file=<filename>."
+            f"\n\nStart by listing PCAPs and ingesting a few to get initial Zeek logs. "
+            f"Then analyze and decide whether to ingest more."
+        )
+    elif pcap_path and Path(pcap_path).is_file():
+        pcap_note = (
+            "\n\nA single PCAP file is available. You can use tshark deep packet inspection "
             "tools (list_pcap_protocols, extract_pcap_stream, apply_bpf_filter, "
             "get_packet_details, extract_http_objects) to inspect raw packet payloads."
         )
@@ -161,6 +385,7 @@ def investigate_node(state: ForensicState) -> dict:
     system_prompt = (
         f"{AGENT_SYSTEM_PROMPT}\n\n"
         f"## AVAILABLE ZEEK LOGS\n{_format_inventory(inventory)}\n\n"
+        f"## AVAILABLE TOOLS\n{_format_tool_catalog(all_tools)}\n\n"
         f"## NETWORK ENVIRONMENT\n"
         f"Internal subnet: {internal_subnet or 'auto-detected'}\n"
         f"Domain: {state.get('domain', 'unknown')}\n\n"
@@ -176,7 +401,9 @@ def investigate_node(state: ForensicState) -> dict:
         HumanMessage(content=(
             "Begin your autonomous forensic investigation. Analyze the network "
             "capture for signs of compromise. Use the available tools to examine "
-            "logs, record findings, and build a complete picture of any attack."
+            "logs, record findings, and build a complete picture of any attack. "
+            "Follow the TOOL CALLING CONTRACT and REQUIRED COVERAGE checklist in "
+            "the system prompt. Do not conclude until coverage is complete."
         )),
     ]
 
@@ -186,6 +413,7 @@ def investigate_node(state: ForensicState) -> dict:
     tool_map = {t.name: t for t in all_tools}
 
     iteration = 0
+    token_estimate_notice_logged = False
     print(f"[INVESTIGATE] Starting autonomous ReAct investigation (max {max_iterations} iterations)...")
 
     while iteration < max_iterations and not state_ref["investigation_complete"]:
@@ -194,6 +422,7 @@ def investigate_node(state: ForensicState) -> dict:
 
         # Get LLM response
         # Get LLM response (streaming to console)
+        estimated_input_tokens = _estimate_input_tokens(messages)
         try:
             response = None
             print("    Agent thought:\n", end="", flush=True)
@@ -211,10 +440,24 @@ def investigate_node(state: ForensicState) -> dict:
             break
 
         # Record token usage (langchain-openai populates usage_metadata)
-        usage = getattr(response, "usage_metadata", None) or {}
+        input_tokens, output_tokens = _extract_usage_tokens(response)
+        if input_tokens == 0 and output_tokens == 0:
+            input_tokens = estimated_input_tokens
+            output_tokens = _estimate_tokens_from_text(
+                _stringify_message_content(getattr(response, "content", ""))
+            )
+            response_tool_calls = getattr(response, "tool_calls", None)
+            if response_tool_calls:
+                output_tokens += _estimate_tokens_from_text(
+                    json.dumps(response_tool_calls, default=str)
+                )
+            if not token_estimate_notice_logged:
+                print("    Note: Provider token metadata missing; using estimated token counts.")
+                token_estimate_notice_logged = True
+
         tracker.record_llm_call(
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
         messages.append(response)
@@ -226,24 +469,7 @@ def investigate_node(state: ForensicState) -> dict:
 
         # Check for tool calls
         if not response.tool_calls:
-            # Fallback: Sometimes local LLMs (like Qwen) output the tool call as a Markdown JSON block 
-            # in the text content, but vLLM fails to parse it natively. Let's catch it manually!
-            import re
-            import json
-            import uuid
-            
-            json_blocks = re.findall(r"```(?:json)?\n(.*?)\n```", response.content, re.DOTALL)
-            for block in json_blocks:
-                try:
-                    parsed = json.loads(block.strip())
-                    if isinstance(parsed, dict) and "name" in parsed:
-                        response.tool_calls.append({
-                            "name": parsed["name"],
-                            "args": parsed.get("arguments", parsed.get("args", {})),
-                            "id": f"call_{uuid.uuid4().hex[:8]}"
-                        })
-                except Exception:
-                    pass
+            response.tool_calls = _extract_tool_calls_from_text(response.content)
 
         if not response.tool_calls:
             state_ref["investigation_notes"].append(
@@ -251,10 +477,13 @@ def investigate_node(state: ForensicState) -> dict:
             )
             # Nudge the agent instead of aborting the whole investigation
             from langchain_core.messages import SystemMessage
+            valid_tools = ", ".join(sorted(tool_map.keys()))
             nudge = SystemMessage(content=(
                 "You provided reasoning but no tools were invoked. "
-                "You must proceed autonomously by invoking a tool to search the logs, "
-                "or call 'finish_investigation' if you have no further actions."
+                "Do NOT output shell commands or explanatory prose. "
+                "Invoke one or more tools now using valid tool names and valid args only. "
+                "If complete, call 'mark_investigation_complete'. "
+                f"Valid tools: {valid_tools}"
             ))
             messages.append(nudge)
             continue
@@ -263,15 +492,23 @@ def investigate_node(state: ForensicState) -> dict:
         from langchain_core.messages import ToolMessage
 
         for tool_call in response.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+            tool_name = tool_call.get("name", "")
+            tool_args = tool_call.get("args", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
 
             print(f"    Tool: {tool_name}({', '.join(f'{k}={repr(v)[:40]}' for k, v in tool_args.items())})")
 
             tracker.record_tool_invocation()
             if tool_name in tool_map:
+                invoke_args, dropped_args = _sanitize_tool_args(tool_map[tool_name], tool_args)
+                if dropped_args:
+                    print(
+                        f"    Note: Dropped unsupported arg(s) for {tool_name}: "
+                        f"{', '.join(dropped_args)}"
+                    )
                 try:
-                    result = tool_map[tool_name].invoke(tool_args)
+                    result = tool_map[tool_name].invoke(invoke_args)
                 except Exception as e:
                     result = f"Tool error: {e}"
                     print(f"    Error: {e}")

@@ -187,69 +187,154 @@ def build_micro_tools(
     ]
 
     # ------------------------------------------------------------------
-    # tshark DPI tools (only if PCAP available)
+    # PCAP tools (ingestion + tshark DPI)
     # ------------------------------------------------------------------
 
-    if pcap_path and Path(pcap_path).exists():
-        _pcap = pcap_path
+    if pcap_path:
+        _pcap_path = Path(pcap_path)
+        _is_pcap_dir = _pcap_path.is_dir()
+
+        def _resolve_pcap(pcap_file: str = "") -> str | None:
+            """Resolve a PCAP file path. Returns the path string or None with error."""
+            if _is_pcap_dir:
+                if not pcap_file:
+                    return None  # caller must handle
+                full = _pcap_path / pcap_file
+                return str(full) if full.exists() else None
+            # Single file mode — ignore pcap_file param
+            return str(_pcap_path) if _pcap_path.exists() else None
+
+        # -- Ingestion tools (PCAP directory only) -------------------------
+
+        if _is_pcap_dir:
+            @tool
+            def list_pcap_files() -> str:
+                """List all PCAP files in the source directory with size and first-packet timestamp. Use this to survey available data before deciding which PCAPs to ingest."""
+                import struct
+                import datetime
+
+                pcaps = sorted(
+                    p for p in _pcap_path.iterdir()
+                    if p.suffix in {".pcap", ".pcapng"}
+                )
+                if not pcaps:
+                    return "No PCAP files found in the source directory."
+
+                lines = []
+                for p in pcaps:
+                    size_mb = p.stat().st_size / (1024 * 1024)
+                    # Read first-packet timestamp from PCAP header (24 byte global + 16 byte pkt)
+                    ts_str = "?"
+                    try:
+                        with open(p, "rb") as fh:
+                            fh.read(24)  # skip global header
+                            pkt_hdr = fh.read(16)
+                            if len(pkt_hdr) >= 8:
+                                ts_sec = struct.unpack("<I", pkt_hdr[:4])[0]
+                                ts_str = datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M UTC")
+                    except Exception:
+                        pass
+                    lines.append(f"  {p.name}  ({size_mb:.0f} MB)  starts: {ts_str}")
+
+                return f"Found {len(pcaps)} PCAP file(s):\n" + "\n".join(lines)
+
+            @tool
+            def ingest_pcap(pcap_filename: str) -> str:
+                """Run Zeek on a specific PCAP file and merge its logs into the analysis directory. After ingestion, all Zeek log tools (grep_log, read_log_head, etc.) will see the new data. Each PCAP takes 1-3 minutes to process."""
+                from .pcap_ingest import ingest_single_pcap
+
+                target = _pcap_path / pcap_filename
+                if not target.exists():
+                    avail = sorted(p.name for p in _pcap_path.iterdir() if p.suffix in {".pcap", ".pcapng"})
+                    hint = ", ".join(avail[:5])
+                    return f"Error: '{pcap_filename}' not found. Available: {hint}..."
+
+                try:
+                    print(f"  [TOOL] Ingesting {pcap_filename} via Zeek ...")
+                    stats = ingest_single_pcap(str(target), log_dir)
+                    if not stats:
+                        return f"Zeek processed {pcap_filename} but produced no log output."
+                    lines = [f"Successfully ingested {pcap_filename}. New records:"]
+                    for log_name, count in sorted(stats.items()):
+                        lines.append(f"  {log_name}: +{count} records")
+                    lines.append("Use list_available_logs to see the updated log inventory.")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Ingestion failed for {pcap_filename}: {e}"
+
+            tools.extend([list_pcap_files, ingest_pcap])
+
+        # -- tshark DPI tools ----------------------------------------------
 
         @tool
-        def list_pcap_protocols() -> str:
-            """List protocol hierarchy statistics from the PCAP file. Shows what protocols are present and their packet/byte counts."""
+        def list_pcap_protocols(pcap_file: str = "") -> str:
+            """List protocol hierarchy statistics from a PCAP file. For PCAP directories, specify which file to analyze."""
+            resolved = _resolve_pcap(pcap_file)
+            if not resolved:
+                return f"PCAP file not found: '{pcap_file}'. Use list_pcap_files to see available files."
             try:
                 result = subprocess.run(
-                    ["tshark", "-r", _pcap, "-qz", "io,phs"],
+                    ["tshark", "-r", resolved, "-qz", "io,phs"],
                     capture_output=True, text=True, timeout=120,
                 )
-                return f"Protocol hierarchy:\n{result.stdout[:4000]}"
+                return f"Protocol hierarchy for {Path(resolved).name}:\n{result.stdout[:4000]}"
             except FileNotFoundError:
                 return "tshark not found. Install Wireshark/tshark to use DPI tools."
             except subprocess.TimeoutExpired:
                 return "tshark timed out."
 
         @tool
-        def extract_pcap_stream(stream_index: int, protocol: str = "tcp") -> str:
-            """Extract and display a TCP or UDP stream from the PCAP by stream index. Shows raw payload bytes and ASCII representation."""
+        def extract_pcap_stream(stream_index: int, protocol: str = "tcp", pcap_file: str = "") -> str:
+            """Extract and display a TCP or UDP stream by stream index. For PCAP directories, specify which file."""
+            resolved = _resolve_pcap(pcap_file)
+            if not resolved:
+                return f"PCAP file not found: '{pcap_file}'. Use list_pcap_files to see available files."
             try:
                 result = subprocess.run(
-                    ["tshark", "-r", _pcap, "-qz", f"follow,{protocol},ascii,{stream_index}"],
+                    ["tshark", "-r", resolved, "-qz", f"follow,{protocol},ascii,{stream_index}"],
                     capture_output=True, text=True, timeout=120,
                 )
                 output = result.stdout[:4000]
                 if len(result.stdout) > 4000:
                     output += "\n[... truncated]"
-                return f"Stream {stream_index} ({protocol}):\n{output}"
+                return f"Stream {stream_index} ({protocol}) from {Path(resolved).name}:\n{output}"
             except FileNotFoundError:
                 return "tshark not found."
             except subprocess.TimeoutExpired:
                 return "tshark timed out."
 
         @tool
-        def apply_bpf_filter(display_filter: str, max_packets: int = 50) -> str:
-            """Apply a Wireshark display filter to the PCAP and return matching packet summaries. Example filters: 'ip.addr == 1.2.3.4', 'tcp.port == 443', 'http.request'."""
+        def apply_bpf_filter(display_filter: str, max_packets: int = 50, pcap_file: str = "") -> str:
+            """Apply a Wireshark display filter to a PCAP and return matching packet summaries. For PCAP directories, specify which file. Example filters: 'ip.addr == 1.2.3.4', 'tcp.port == 443'."""
+            resolved = _resolve_pcap(pcap_file)
+            if not resolved:
+                return f"PCAP file not found: '{pcap_file}'. Use list_pcap_files to see available files."
             try:
                 result = subprocess.run(
-                    ["tshark", "-r", _pcap, "-Y", display_filter, "-c", str(max_packets)],
+                    ["tshark", "-r", resolved, "-Y", display_filter, "-c", str(max_packets)],
                     capture_output=True, text=True, timeout=120,
                 )
                 output = result.stdout[:4000]
                 if len(result.stdout) > 4000:
                     output += "\n[... truncated]"
-                return f"Filter '{display_filter}' ({max_packets} max):\n{output}"
+                return f"Filter '{display_filter}' on {Path(resolved).name} ({max_packets} max):\n{output}"
             except FileNotFoundError:
                 return "tshark not found."
             except subprocess.TimeoutExpired:
                 return "tshark timed out."
 
         @tool
-        def get_packet_details(start_frame: int, end_frame: int) -> str:
-            """Get detailed packet dissection for a range of frame numbers. Shows headers and payload details."""
+        def get_packet_details(start_frame: int, end_frame: int, pcap_file: str = "") -> str:
+            """Get detailed packet dissection for a range of frame numbers. For PCAP directories, specify which file."""
+            resolved = _resolve_pcap(pcap_file)
+            if not resolved:
+                return f"PCAP file not found: '{pcap_file}'. Use list_pcap_files to see available files."
             frame_range = min(end_frame - start_frame + 1, 10)
             actual_end = start_frame + frame_range - 1
             try:
                 result = subprocess.run(
                     [
-                        "tshark", "-r", _pcap,
+                        "tshark", "-r", resolved,
                         "-Y", f"frame.number >= {start_frame} && frame.number <= {actual_end}",
                         "-V",
                     ],
@@ -258,83 +343,39 @@ def build_micro_tools(
                 output = result.stdout[:4000]
                 if len(result.stdout) > 4000:
                     output += "\n[... truncated]"
-                return f"Packets {start_frame}-{actual_end}:\n{output}"
+                return f"Packets {start_frame}-{actual_end} from {Path(resolved).name}:\n{output}"
             except FileNotFoundError:
                 return "tshark not found."
             except subprocess.TimeoutExpired:
                 return "tshark timed out."
 
         @tool
-        def extract_http_objects() -> str:
-            """Export HTTP objects (files) from the PCAP. Lists extracted files and their details."""
+        def extract_http_objects(pcap_file: str = "") -> str:
+            """Export HTTP objects (files) from a PCAP. For PCAP directories, specify which file."""
+            resolved = _resolve_pcap(pcap_file)
+            if not resolved:
+                return f"PCAP file not found: '{pcap_file}'. Use list_pcap_files to see available files."
             import tempfile
             outdir = Path(tempfile.mkdtemp(prefix="http_objects_"))
             try:
                 subprocess.run(
-                    ["tshark", "-r", _pcap, "--export-objects", f"http,{outdir}"],
+                    ["tshark", "-r", resolved, "--export-objects", f"http,{outdir}"],
                     capture_output=True, text=True, timeout=120,
                 )
                 files = list(outdir.iterdir())
                 if not files:
-                    return "No HTTP objects found in PCAP."
+                    return f"No HTTP objects found in {Path(resolved).name}."
                 lines = []
                 for f in files[:50]:
                     lines.append(f"  {f.name} ({f.stat().st_size:,} bytes)")
-                result = f"Extracted {len(files)} HTTP object(s):\n" + "\n".join(lines)
+                out = f"Extracted {len(files)} HTTP object(s) from {Path(resolved).name}:\n" + "\n".join(lines)
                 if len(files) > 50:
-                    result += f"\n[... {len(files) - 50} more files]"
-                return result
+                    out += f"\n[... {len(files) - 50} more files]"
+                return out
             except FileNotFoundError:
                 return "tshark not found."
             except subprocess.TimeoutExpired:
                 return "tshark timed out."
-
-        # ------------------------------------------------------------------
-        # Selective Ingestion Tools (Only if input is a PCAP directory)
-        # ------------------------------------------------------------------
-
-        @tool
-        def list_available_pcaps() -> str:
-            """List all PCAP files available in the source directory for ingestion.
-            Use this to see which dates/times to analyze next.
-            """
-            if not pcap_path or not Path(pcap_path).is_dir():
-                return "No source PCAP directory available in this investigation environment."
-            
-            pcaps = sorted([
-                p.name for p in Path(pcap_path).iterdir()
-                if p.suffix in {".pcap", ".pcapng"}
-            ])
-            if not pcaps:
-                return "No PCAP files found in the source directory."
-            
-            return f"Found {len(pcaps)} available PCAP(s):\n" + "\n".join(f"  - {p}" for p in pcaps)
-
-        @tool
-        def ingest_pcap(filename: str) -> str:
-            """Run Zeek on a specific PCAP file from the source directory and add its telemetry
-            to the working log directory. This merges and sorts the new data into existing logs.
-            """
-            from .pcap_ingest import ingest_single_pcap
-            if not pcap_path or not Path(pcap_path).is_dir():
-                return "Error: No source PCAP directory configured."
-            
-            target = Path(pcap_path) / filename
-            if not target.exists():
-                return f"Error: PCAP '{filename}' not found. Use `list_available_pcaps` first."
-
-            try:
-                print(f"[TOOL] Ingesting {filename} ...")
-                stats = ingest_single_pcap(str(target), log_dir)
-                if not stats:
-                    return f"PCAP {filename} processed, but no relevant Zeek logs were produced."
-                
-                lines = [f"Successfully ingested {filename}. Records added for:"]
-                for log_name, count in stats.items():
-                    lines.append(f"  - {log_name}: {count} records")
-                return "\n".join(lines)
-            except Exception as e:
-                return f"Failed to ingest {filename}: {str(e)}"
 
         tools.extend([
             list_pcap_protocols,
@@ -342,8 +383,6 @@ def build_micro_tools(
             apply_bpf_filter,
             get_packet_details,
             extract_http_objects,
-            list_available_pcaps,
-            ingest_pcap,
         ])
 
     return tools

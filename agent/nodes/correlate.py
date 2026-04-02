@@ -32,6 +32,17 @@ def correlate_node(state: ForensicState) -> dict:
     raw_iocs = state.get("iocs", [])
     raw_timeline = state.get("timeline_events", [])
 
+    # --- Deduplicate raw findings by ID ---
+    seen_finding_ids: set[str] = set()
+    deduped_findings: list[dict] = []
+    for f in raw_findings:
+        fid = f.get("id", "")
+        if fid and fid in seen_finding_ids:
+            continue
+        seen_finding_ids.add(fid)
+        deduped_findings.append(f)
+    raw_findings = deduped_findings
+
     # --- Build Finding objects ---
     findings: list[Finding] = []
     mitre_mappings: list[MITREMapping] = []
@@ -90,6 +101,7 @@ def correlate_node(state: ForensicState) -> dict:
 
     # --- Build timeline (dedup and sort) ---
     timeline: list[TimelineEvent] = []
+    seen_tl_keys: set[tuple] = set()
     for evt in raw_timeline:
         ts_raw = evt.get("timestamp", "0")
         try:
@@ -98,6 +110,11 @@ def correlate_node(state: ForensicState) -> dict:
         except (ValueError, TypeError):
             ts_float = 0.0
             ts_human = str(ts_raw)
+
+        tl_key = (ts_raw, evt.get("source_ip", ""), evt.get("dest_ip", ""))
+        if tl_key in seen_tl_keys:
+            continue
+        seen_tl_keys.add(tl_key)
 
         timeline.append(TimelineEvent(
             timestamp=ts_float,

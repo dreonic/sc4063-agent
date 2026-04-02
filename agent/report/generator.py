@@ -288,6 +288,20 @@ class ReportGenerator:
             return "## Attack Timeline\n\n*No timeline events.*"
 
         sorted_events = sorted(events, key=lambda e: e.timestamp)
+        total = len(sorted_events)
+
+        _TIMELINE_CAP = 200
+        if total > _TIMELINE_CAP:
+            half = _TIMELINE_CAP // 2
+            display_events = sorted_events[:half] + sorted_events[-half:]
+            omitted = total - _TIMELINE_CAP
+            cap_note = (
+                f"\n> *Showing first {half} and last {half} of {total:,} total events "
+                f"({omitted:,} middle events omitted for brevity.)*\n"
+            )
+        else:
+            display_events = sorted_events
+            cap_note = ""
 
         lines = [
             "## Attack Timeline",
@@ -295,7 +309,7 @@ class ReportGenerator:
             "| # | Timestamp (UTC) | Source | Destination | Phase | Description | MITRE |",
             "| --- | --- | --- | --- | --- | --- | --- |",
         ]
-        for idx, evt in enumerate(sorted_events, 1):
+        for idx, evt in enumerate(display_events, 1):
             desc_short = (
                 (evt.description[:80] + "...")
                 if len(evt.description) > 80
@@ -307,6 +321,8 @@ class ReportGenerator:
                 f"| {evt.phase} | {desc_short} "
                 f"| `{evt.mitre_id or '—'}` |"
             )
+        if cap_note:
+            lines.append(cap_note)
         return "\n".join(lines)
 
     def _render_recommendations(self) -> str:

@@ -18,6 +18,35 @@ from ..models import LogFile, LogCategory, NetworkHost
 
 MAX_FINDINGS_CHARS = 4000
 
+_MITRE_NAMES: dict[str, str] = {
+    "T1133": "External Remote Services",
+    "T1078": "Valid Accounts",
+    "T1078.002": "Valid Accounts: Domain Accounts",
+    "T1110.003": "Brute Force: Password Spraying",
+    "T1021.002": "Remote Services: SMB/Windows Admin Shares",
+    "T1021.006": "Remote Services: Windows Remote Management",
+    "T1087.002": "Account Discovery: Domain Account",
+    "T1069.002": "Permission Groups Discovery: Domain Groups",
+    "T1558": "Steal or Forge Kerberos Tickets",
+    "T1090.003": "Proxy: Multi-hop Proxy",
+    "T1572": "Protocol Tunneling",
+    "T1573.002": "Encrypted Channel: Asymmetric Cryptography",
+    "T1567.002": "Exfiltration Over Web Service: Exfiltration to Cloud Storage",
+    "T1016": "System Network Configuration Discovery",
+    "T1039": "Data from Network Shared Drive",
+    "T1059.001": "Command and Scripting Interpreter: PowerShell",
+    "T1484.001": "Domain Policy Modification: Group Policy Modification",
+    "T1105": "Ingress Tool Transfer",
+    "T1041": "Exfiltration Over C2 Channel",
+    "T1048": "Exfiltration Over Alternative Protocol",
+    "T1567": "Exfiltration Over Web Service",
+    "T1135": "Network Share Discovery",
+    "T1021": "Remote Services",
+    "T1027": "Obfuscated Files or Information",
+    "T1566": "Phishing",
+    "T1110": "Brute Force",
+}
+
 
 def _serialize_phase_result(result) -> str:
     """Convert a PhaseResult to a JSON-friendly string, truncated to fit context."""
@@ -144,7 +173,7 @@ def build_macro_tools(
                 "evidence_description": edesc,
                 "evidence_line": None,
                 "mitre_tactic": mtac,
-                "mitre_technique": "",
+                "mitre_technique": _MITRE_NAMES.get(mid, ""),
                 "mitre_id": mid,
             })
         
@@ -170,6 +199,23 @@ def build_macro_tools(
             
         return findings, iocs, timeline
 
+    def _merge_into_state(state_ref, fnd, ioc, tl):
+        """Merge findings/IOCs/timeline into state, skipping duplicates."""
+        existing_finding_ids = {f["id"] for f in state_ref["findings"]}
+        state_ref["findings"].extend(f for f in fnd if f["id"] not in existing_finding_ids)
+
+        existing_ioc_keys = {(i["type"], i["value"]) for i in state_ref["iocs"]}
+        state_ref["iocs"].extend(i for i in ioc if (i["type"], i["value"]) not in existing_ioc_keys)
+
+        existing_tl_keys = {
+            (t["timestamp"], t["source_ip"], t["dest_ip"])
+            for t in state_ref["timeline_events"]
+        }
+        state_ref["timeline_events"].extend(
+            t for t in tl
+            if (t["timestamp"], t["source_ip"], t["dest_ip"]) not in existing_tl_keys
+        )
+
     @tool
     def run_initial_access_analysis() -> str:
         """Run a complete initial access analysis. Detects external RDP, C2 tunnels, HTTP CONNECT, protocol anomalies, suspicious user-agents, and identifies Patient Zero."""
@@ -179,9 +225,7 @@ def build_macro_tools(
         result = analyzer.run()
         if state_ref is not None:
             fnd, ioc, tl = _dictify(result)
-            state_ref["findings"].extend(fnd)
-            state_ref["iocs"].extend(ioc)
-            state_ref["timeline_events"].extend(tl)
+            _merge_into_state(state_ref, fnd, ioc, tl)
         return f"Initial Access Analysis Complete:\n{_serialize_phase_result(result)}"
 
     @tool
@@ -193,9 +237,7 @@ def build_macro_tools(
         result = analyzer.run()
         if state_ref is not None:
             fnd, ioc, tl = _dictify(result)
-            state_ref["findings"].extend(fnd)
-            state_ref["iocs"].extend(ioc)
-            state_ref["timeline_events"].extend(tl)
+            _merge_into_state(state_ref, fnd, ioc, tl)
         return f"Lateral Movement Analysis Complete:\n{_serialize_phase_result(result)}"
 
     @tool
@@ -207,9 +249,7 @@ def build_macro_tools(
         result = analyzer.run()
         if state_ref is not None:
             fnd, ioc, tl = _dictify(result)
-            state_ref["findings"].extend(fnd)
-            state_ref["iocs"].extend(ioc)
-            state_ref["timeline_events"].extend(tl)
+            _merge_into_state(state_ref, fnd, ioc, tl)
         return f"Exfiltration Analysis Complete:\n{_serialize_phase_result(result)}"
 
     @tool
@@ -221,9 +261,7 @@ def build_macro_tools(
         result = analyzer.run()
         if state_ref is not None:
             fnd, ioc, tl = _dictify(result)
-            state_ref["findings"].extend(fnd)
-            state_ref["iocs"].extend(ioc)
-            state_ref["timeline_events"].extend(tl)
+            _merge_into_state(state_ref, fnd, ioc, tl)
         return f"Payload Analysis Complete:\n{_serialize_phase_result(result)}"
 
     return [

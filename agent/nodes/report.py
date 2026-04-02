@@ -1,6 +1,7 @@
 """Report node — generate the final Markdown forensic report."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from langchain_openai import ChatOpenAI
@@ -14,6 +15,9 @@ from ..models import (
 )
 from ..report.generator import ReportGenerator
 from ..state import ForensicState
+
+
+CHARS_PER_TOKEN_ESTIMATE = 4
 
 
 def _rebuild_log_inventory(inventory_dicts: list[dict]) -> list[LogFile]:
@@ -51,6 +55,64 @@ def _rebuild_hosts(host_dicts: list[dict]) -> list[NetworkHost]:
     ]
 
 
+def _estimate_tokens_from_text(text: str) -> int:
+    """Approximate token count when provider metadata is unavailable."""
+    if not text:
+        return 0
+    return max(1, (len(text) + CHARS_PER_TOKEN_ESTIMATE - 1) // CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _extract_usage_tokens(response) -> tuple[int, int]:
+    """Extract input/output token counts across common response schemas."""
+    usage_candidates: list[dict] = []
+
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, dict):
+        usage_candidates.append(usage)
+
+    response_metadata = getattr(response, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        for key in ("token_usage", "usage", "usage_metadata"):
+            value = response_metadata.get(key)
+            if isinstance(value, dict):
+                usage_candidates.append(value)
+
+    additional_kwargs = getattr(response, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        for key in ("token_usage", "usage"):
+            value = additional_kwargs.get(key)
+            if isinstance(value, dict):
+                usage_candidates.append(value)
+
+    for candidate in usage_candidates:
+        input_tokens = candidate.get("input_tokens")
+        if input_tokens is None:
+            input_tokens = candidate.get("prompt_tokens")
+        if input_tokens is None:
+            input_tokens = candidate.get("input_token_count")
+        if input_tokens is None:
+            input_tokens = candidate.get("prompt_token_count")
+
+        output_tokens = candidate.get("output_tokens")
+        if output_tokens is None:
+            output_tokens = candidate.get("completion_tokens")
+        if output_tokens is None:
+            output_tokens = candidate.get("output_token_count")
+        if output_tokens is None:
+            output_tokens = candidate.get("completion_token_count")
+
+        try:
+            in_tok = int(input_tokens or 0)
+            out_tok = int(output_tokens or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if in_tok > 0 or out_tok > 0:
+            return in_tok, out_tok
+
+    return 0, 0
+
+
 def report_node(state: ForensicState) -> dict:
     """Generate the final Markdown forensic report and optionally enhance
     the executive summary with an LLM call."""
@@ -65,6 +127,7 @@ def report_node(state: ForensicState) -> dict:
     # Rebuild structured objects from state
     log_inventory = _rebuild_log_inventory(state.get("log_inventory", []))
     network_hosts = _rebuild_hosts(state.get("network_hosts", []))
+    cost_metrics = dict(state.get("cost_metrics", {}))
 
     # Attempt LLM-enhanced executive summary
     executive_summary = state.get("executive_summary", "")
@@ -94,6 +157,22 @@ def report_node(state: ForensicState) -> dict:
             HumanMessage(content=prompt),
         ])
         executive_summary = response.content
+
+        # Record token accounting for the report LLM call.
+        input_tokens, output_tokens = _extract_usage_tokens(response)
+        if input_tokens == 0 and output_tokens == 0:
+            input_tokens = _estimate_tokens_from_text(FORENSIC_SYSTEM_PROMPT) + _estimate_tokens_from_text(prompt)
+            output_tokens = _estimate_tokens_from_text(str(response.content))
+
+        cost_metrics["total_llm_calls"] = int(cost_metrics.get("total_llm_calls", 0)) + 1
+        cost_metrics["total_input_tokens"] = int(cost_metrics.get("total_input_tokens", 0)) + input_tokens
+        cost_metrics["total_output_tokens"] = int(cost_metrics.get("total_output_tokens", 0)) + output_tokens
+        cost_metrics["api_cost"] = round(
+            (cost_metrics["total_input_tokens"] / 1000) * config.api_input_cost_per_1k
+            + (cost_metrics["total_output_tokens"] / 1000) * config.api_output_cost_per_1k,
+            4,
+        )
+
         print("[REPORT] LLM executive summary generated.")
     except Exception as e:
         print(f"[REPORT] LLM summary failed ({e}), using deterministic summary.")
@@ -111,7 +190,7 @@ def report_node(state: ForensicState) -> dict:
         executive_summary=executive_summary,
         recommendations=state.get("recommendations", []),
         kill_chain_phases=state.get("kill_chain_phases", []),
-        cost_metrics=state.get("cost_metrics", {}),
+        cost_metrics=cost_metrics,
         investigation_notes=state.get("investigation_notes", []),
     )
 
@@ -127,4 +206,5 @@ def report_node(state: ForensicState) -> dict:
     return {
         "report_path": str(output_path),
         "executive_summary": executive_summary,
+        "cost_metrics": cost_metrics,
     }
