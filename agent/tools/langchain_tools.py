@@ -55,6 +55,46 @@ def build_micro_tools(
     _successful_pcaps: list[str] = []  # ones that produced at least one log
     _get_time_range_call_count: dict[str, int] = {}   # per-log limiter
 
+    # Pre-compute timestamp-based representative PCAP list once at construction.
+    # This is used by list_available_logs, list_pcap_files, and ingest_pcap
+    # to give consistent "next untried" hints without relying on batch-label regex.
+    def _compute_timestamp_reps(pcap_dir: Path, n: int = 18) -> list[str]:
+        import struct as _st
+        timed: list[tuple[float, str]] = []
+        for p in sorted(pcap_dir.iterdir()):
+            if p.suffix in {".pcap", ".pcapng"}:
+                try:
+                    with open(p, "rb") as fh:
+                        fh.read(24)
+                        hdr = fh.read(16)
+                        if len(hdr) >= 4:
+                            ts = _st.unpack("<I", hdr[:4])[0]
+                            timed.append((float(ts), p.name))
+                except Exception:
+                    pass
+        timed.sort(key=lambda x: x[0])
+        if not timed:
+            return []
+        if len(timed) <= n:
+            return [name for _, name in timed]
+        earliest, latest = timed[0][0], timed[-1][0]
+        span = latest - earliest
+        selected: list[str] = []
+        used: set[str] = set()
+        for i in range(n):
+            target = earliest + (span * i / (n - 1))
+            best = min(timed, key=lambda x: (abs(x[0] - target), x[1] in used))
+            if best[1] not in used:
+                selected.append(best[1])
+                used.add(best[1])
+        return selected
+
+    _timestamp_reps: list[str] = (
+        _compute_timestamp_reps(Path(pcap_path))
+        if (pcap_path and Path(pcap_path).is_dir())
+        else []
+    )
+
     # ------------------------------------------------------------------
     # Zeek log micro tools
     # ------------------------------------------------------------------
@@ -62,24 +102,13 @@ def build_micro_tools(
     @tool
     def list_available_logs() -> str:
         """List all Zeek log files in the analysis directory with their field names and sizes."""
-        import re as _re
         log_path = Path(log_dir)
         logs = sorted(log_path.glob("*.log"))
         if not logs:
             msg = "No Zeek logs found yet."
             if pcap_path and Path(pcap_path).is_dir():
-                # Find the next untried representative PCAP and direct the agent to it
-                _pcap_dir = Path(pcap_path)
-                all_pcaps = sorted(p.name for p in _pcap_dir.iterdir() if p.suffix in {".pcap", ".pcapng"})
-                seen_groups: set[str] = set()
-                reps: list[str] = []
-                for name in all_pcaps:
-                    m = _re.search(r'-(\d{6})-', name)
-                    key = m.group(1) if m else name
-                    if key not in seen_groups:
-                        seen_groups.add(key)
-                        reps.append(name)
-                untried = [f for f in reps if f not in _attempted_pcaps]
+                # Find the next untried representative PCAP using timestamp-based selection
+                untried = [f for f in _timestamp_reps if f not in _attempted_pcaps]
                 if untried:
                     next_file = untried[0]
                     msg += (
@@ -290,7 +319,6 @@ def build_micro_tools(
                 """List PCAP files grouped by date with ready-to-use ingest_pcap calls. Call this ONCE, then immediately call ingest_pcap for each group. Do NOT call this tool more than once."""
                 import struct
                 import datetime
-                import re as _re
 
                 _list_pcap_call_count[0] += 1
 
@@ -334,21 +362,9 @@ def build_micro_tools(
                             pass
 
                 if _list_pcap_call_count[0] > 1:
-                    # Find first UNTRIED representative file to direct the agent
-                    pcaps_hint = sorted(
-                        p for p in _pcap_path.iterdir()
-                        if p.suffix in {".pcap", ".pcapng"}
-                    )
-                    seen: set[str] = set()
-                    reps = []
-                    for p in pcaps_hint:
-                        m = _re.search(r'-(\d{6})-', p.name)
-                        key = m.group(1) if m else p.name
-                        if key not in seen:
-                            seen.add(key)
-                            reps.append(p.name)
-                    untried = [f for f in reps if f not in _attempted_pcaps]
-                    next_file = untried[0] if untried else (reps[0] if reps else "the_first.pcap")
+                    # Use timestamp-based representative list to find next untried file
+                    untried = [f for f in _timestamp_reps if f not in _attempted_pcaps]
+                    next_file = untried[0] if untried else (_timestamp_reps[0] if _timestamp_reps else "the_first.pcap")
                     return (
                         f"ERROR: Do NOT call list_pcap_files again.\n"
                         f"Already attempted: {_attempted_pcaps or 'none yet'}.\n"
@@ -363,56 +379,73 @@ def build_micro_tools(
                 if not pcaps:
                     return "No PCAP files found in the source directory."
 
-                def _read_ts(path):
+                # Read first-packet timestamp from each PCAP's global header
+                def _read_ts_epoch(path):
                     try:
                         with open(path, "rb") as fh:
                             fh.read(24)
                             pkt_hdr = fh.read(16)
                             if len(pkt_hdr) >= 8:
-                                ts_sec = struct.unpack("<I", pkt_hdr[:4])[0]
-                                return datetime.datetime.fromtimestamp(ts_sec, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                                return struct.unpack("<I", pkt_hdr[:4])[0]
                     except Exception:
                         pass
-                    return "?"
+                    return None
 
-                # Group by the date portion in the filename (e.g. "250301")
-                groups: dict[str, list] = {}
+                # Build list of (epoch, path) sorted by actual packet time
+                timed = []
                 for p in pcaps:
-                    m = _re.search(r'-(\d{6})-', p.name)
-                    key = m.group(1) if m else "unknown"
-                    groups.setdefault(key, []).append(p)
+                    ts = _read_ts_epoch(p)
+                    if ts is not None:
+                        timed.append((ts, p))
+                timed.sort(key=lambda x: x[0])
+
+                if not timed:
+                    return "Could not read timestamps from PCAP files."
+
+                earliest_ts = timed[0][0]
+                latest_ts = timed[-1][0]
+                span_days = (latest_ts - earliest_ts) / 86400
+
+                # Select ~18 files evenly distributed across the actual time span
+                n_select = 18
+                selected = []
+                used = set()
+                for i in range(n_select):
+                    target = earliest_ts + (span_days * 86400 * i / (n_select - 1))
+                    best = min(timed, key=lambda x: (abs(x[0] - target), x[1].name in used))
+                    if best[1].name not in used:
+                        selected.append(best)
+                        used.add(best[1].name)
+
+                def _fmt(ts):
+                    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
                 lines = [
-                    f"Found {len(pcaps)} PCAP file(s) in {len(groups)} date groups.",
-                    "WARNING: Call this tool only ONCE. Now call ingest_pcap for each group below.\n",
+                    f"Found {len(pcaps)} PCAP files spanning {_fmt(earliest_ts)} → {_fmt(latest_ts)} ({span_days:.1f} days).",
+                    f"Selected {len(selected)} representative files evenly distributed across the incident window.",
+                    "Call ingest_pcap for EACH file below (one call per message) to achieve full temporal coverage:\n",
                 ]
-                for key in sorted(groups.keys()):
-                    grp = groups[key]
-                    first_ts = _read_ts(grp[0])
-                    last_ts = _read_ts(grp[-1])
-                    lines.append(
-                        f"Group {key} ({len(grp)} files): "
-                        f"incident time {first_ts} → {last_ts}"
-                    )
-                    lines.append(f"  Ingest: {grp[0].name}")
+                for ts, p in selected:
+                    lines.append(f"  {_fmt(ts)}  {p.name}")
 
-                lines.append(
-                    "\nCall ingest_pcap for EACH group (one call per message):"
-                )
-                for key in sorted(groups.keys()):
-                    grp = groups[key]
+                lines.append("\nReady-to-use ingest_pcap calls:")
+                for _, p in selected:
                     lines.append(
-                        f'  {{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{grp[0].name}"}}}}'
+                        f'  {{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{p.name}"}}}}'
                     )
+                lines.append(
+                    "\nAfter ingesting all files, call get_time_range on conn.log to verify coverage, "
+                    "then proceed to Phase 2 macro analysis."
+                )
 
                 result_str = "\n".join(lines)
-                print(f"  [list_pcap_files] {len(groups)} date groups: {sorted(groups.keys())}")
+                print(f"  [list_pcap_files] {len(selected)} timestamp-selected files across {span_days:.1f} day span")
                 return result_str
 
             @tool
             def ingest_pcap(pcap_filename: str) -> str:
                 """Run Zeek on a specific PCAP file and merge its logs into the analysis directory. After ingestion, all Zeek log tools (grep_log, read_log_head, etc.) will see the new data. Each PCAP takes 1-3 minutes to process."""
-                import re as _re2
+                import re as _re_grp
                 from .pcap_ingest import ingest_single_pcap
 
                 # Record this attempt regardless of outcome
@@ -433,25 +466,15 @@ def build_micro_tools(
                     hint = ", ".join(avail[:5])
                     return f"Error: '{pcap_filename}' not found. Available: {hint}..."
 
-                # Find next untried representative to suggest on failure
-                all_pcaps = sorted(p.name for p in _pcap_path.iterdir() if p.suffix in {".pcap", ".pcapng"})
-                seen_g: set[str] = set()
-                reps: list[str] = []
-                for name in all_pcaps:
-                    m = _re2.search(r'-(\d{6})-', name)
-                    key = m.group(1) if m else name
-                    if key not in seen_g:
-                        seen_g.add(key)
-                        reps.append(name)
-                untried = [f for f in reps if f not in _attempted_pcaps]
+                # Find next untried representative using timestamp-based selection
+                untried = [f for f in _timestamp_reps if f not in _attempted_pcaps]
                 next_hint = (
                     f'\nNext: {{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{untried[0]}"}}}}'
-                    if untried else "\nAll date groups have been attempted."
+                    if untried else "\nAll representative files have been ingested."
                 )
 
                 try:
-                    import re as _re3
-                    _grp_m = _re3.search(r'-(\d{6})-', pcap_filename)
+                    _grp_m = _re_grp.search(r'-(\d{6})-', pcap_filename)
                     _grp_key = _grp_m.group(1) if _grp_m else "unknown"
                     print(f"  [INGEST] Starting: {pcap_filename} (date group {_grp_key}) ...")
                     stats = ingest_single_pcap(str(target), log_dir)

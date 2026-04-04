@@ -186,8 +186,10 @@ def build_macro_tools(
                 "source_phase": i.source_phase,
             })
             
+        # Cap to 30 events per phase — individual RDP/connection records can number
+        # in the thousands and would flood the report timeline with identical entries.
         timeline = []
-        for t in result.timeline_events:
+        for t in result.timeline_events[:30]:
             timeline.append({
                 "timestamp": t.timestamp_human,
                 "description": t.description,
@@ -196,25 +198,34 @@ def build_macro_tools(
                 "phase": result.phase_name,
                 "mitre_id": t.mitre_id,
             })
-            
+
         return findings, iocs, timeline
 
     def _merge_into_state(state_ref, fnd, ioc, tl):
-        """Merge findings/IOCs/timeline into state, skipping duplicates."""
+        """Merge findings/IOCs/timeline into state, skipping duplicates.
+
+        Total timeline capped at 200 events across all phases to keep the
+        report timeline meaningful rather than a raw connection log.
+        """
         existing_finding_ids = {f["id"] for f in state_ref["findings"]}
         state_ref["findings"].extend(f for f in fnd if f["id"] not in existing_finding_ids)
 
         existing_ioc_keys = {(i["type"], i["value"]) for i in state_ref["iocs"]}
         state_ref["iocs"].extend(i for i in ioc if (i["type"], i["value"]) not in existing_ioc_keys)
 
+        # Hard cap: no more than 200 total timeline events from macro tools
+        remaining_slots = max(0, 200 - len(state_ref["timeline_events"]))
+        if remaining_slots == 0:
+            return
         existing_tl_keys = {
             (t["timestamp"], t["source_ip"], t["dest_ip"])
             for t in state_ref["timeline_events"]
         }
-        state_ref["timeline_events"].extend(
+        new_events = [
             t for t in tl
             if (t["timestamp"], t["source_ip"], t["dest_ip"]) not in existing_tl_keys
-        )
+        ]
+        state_ref["timeline_events"].extend(new_events[:remaining_slots])
 
     @tool
     def run_initial_access_analysis() -> str:

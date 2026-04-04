@@ -68,11 +68,24 @@ Run all four macro tools to establish baseline findings. Call each tool exactly 
 Work through each task in order. For each task, call the tool and record what you found.
 
 ### 3A — Initial Access: Identify Primary Attacker IP
-Call this tool:
+
+Start with the volume-based view:
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "rdp.log", "field": "id.orig_h", "n": 20}}
 ```
-Identify which external IP originated the most RDP sessions. That is the primary attacker. Record it with `record_ioc` if not already in macro findings.
+
+Then check the anomaly/alert log if it exists:
+```json
+{"name": "read_log_head", "arguments": {"log_name": "dpd.log", "n": 50}}
+```
+
+**Forensic reasoning — do not skip this step:**
+The IP with the most sessions in rdp.log is often a mass internet scanner, not the targeted attacker. A true targeted attacker typically:
+- Appears in filtered anomaly logs (dpd.log, notice.log) that flag protocol violations or unusual behaviour
+- Uses a small number of *authenticated* sessions (HYBRID/NLA success) rather than thousands of probe connections
+- May appear in multiple logs (rdp + dns + ssl + http) as a single cohesive actor
+
+Cross-reference the top session-count IPs against any anomaly logs. If dpd.log or notice.log contains external IPs connecting to the same service port with protocol anomalies, those are higher-confidence targeted attacker candidates than raw session volume. Record the best-evidence attacker IP as an IOC.
 
 ### 3B — Initial Access: Confirm Attack Timeline
 Call these tools:
@@ -95,10 +108,28 @@ Call these tools one at a time:
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "kerberos.log", "field": "client", "n": 20}}
 ```
-Which domain accounts were targeted? Which authenticated successfully after failures? Record compromised accounts as IOCs.
+
+**Forensic reasoning:**
+- A host generating many failures with *dictionary/generic usernames* (admin, administrator, test, user, guest) against multiple targets is a spray attack — the credential sprayer itself is likely already compromised or is attacker-controlled.
+- A host generating successful authentications with *real account names* to many unique destinations is lateral movement using stolen credentials — that source IP is the attacker's pivot.
+- Kerberos TGTs requested for high-privilege accounts (domain admin, krbtgt service) are particularly significant — note the requesting host and the target domain/service.
+
+Record accounts that successfully authenticated after failures, and the source IPs performing successful mass NTLM auth, as IOCs.
+
+**Patient Zero outbound auth check:**
+Once you have identified Patient Zero (the initial foothold host from Phase 3A/3B), check its outbound authentication activity specifically:
+```json
+{"name": "grep_log", "arguments": {"log_name": "ntlm.log", "pattern": "<patient_zero_ip>", "max_results": 30}}
+```
+Replace `<patient_zero_ip>` with the actual Patient Zero IP. A compromised host used for lateral movement will appear as a *source* in ntlm.log with successful authentications to many different internal destinations. This is distinct from the spray attack (which has many failures from a spray host) — lateral movement from Patient Zero uses valid stolen credentials and succeeds quietly.
+
+**Action required:** Record the real account names and destination IPs as IOCs. If Patient Zero appears as a *source* with successful NTLM authentications to 5 or more unique internal destinations, record a **CRITICAL finding** titled "NTLM Lateral Movement Detected" (mitre_tactic: "Lateral Movement", mitre_id: "T1078.002") citing the number of successful authentications, unique destination count, and the account names observed. This finding is separate from any credential spray finding — do not merge them.
 
 ### 3D — Exfiltration Domain Check (MANDATORY — do not skip)
-The Lynx group uses temp.sh, transfer.sh, and korsan.me. Check each one:
+
+Check DNS and SSL logs for domains associated with file-sharing and exfiltration services. These include temporary file hosting services, anonymous upload services, and any C2 domains identified by threat intelligence for the suspected threat actor.
+
+Known exfiltration service patterns to check in dns.log and ssl.log:
 ```json
 {"name": "grep_count", "arguments": {"log_name": "dns.log", "pattern": "temp.sh"}}
 ```
@@ -114,16 +145,60 @@ The Lynx group uses temp.sh, transfer.sh, and korsan.me. Check each one:
 ```json
 {"name": "grep_count", "arguments": {"log_name": "ssl.log", "pattern": "korsan.me"}}
 ```
-If ANY returns count > 0, follow up with `grep_log` and record a CRITICAL finding with `record_finding`.
+
+**Forensic reasoning:** Any count > 0 for an external file-sharing or C2 domain is significant. Follow up with `grep_log` to retrieve the actual records — note the querying internal hosts, timestamps, and resolved IPs. A small number of DNS lookups to a file-sharing service (2–20) followed by TLS sessions to the resolved IP is the classic exfiltration pattern. Record as CRITICAL if confirmed.
+
+Also check http.log for CONNECT tunneling to any C2 domains found:
+```json
+{"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "CONNECT"}}
+```
+If count > 0, follow up with `grep_log` to identify what destinations are being tunneled to:
+```json
+{"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "CONNECT", "max_results": 20}}
+```
+
+**Action required:** If any HTTP CONNECT records are found, record a finding titled "HTTP CONNECT Tunneling Detected" (mitre_tactic: "Command and Control", mitre_id: "T1572") citing the source IP, destination host in the Host header, and user-agent. Severity: HIGH if destination is a generic domain; CRITICAL if the destination matches a known exfil or C2 domain found in Phase 3D.
+
+### 3D.5 — HTTP Log Deep Analysis
+
+The http.log is often small and fully readable, but contains high-value evidence. Read it:
+```json
+{"name": "read_log_head", "arguments": {"log_name": "http.log", "n": 50}}
+```
+Then check for remote execution activity (WinRM):
+```json
+{"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "wsman"}}
+```
+
+**Forensic reasoning:**
+HTTP logs contain four classes of attacker evidence that are easy to miss:
+
+1. **Remote execution**: POST requests to `/wsman` are Windows Remote Management (WinRM). If internal hosts are POSTing to other internal hosts on port 5985/5986, or if external IPs are posting to internal hosts, this is remote command execution. Note the user-agent, payload size, and HTTP status — a 200 response with a large request body means the command ran successfully.
+
+2. **Automated tooling via user-agent**: Legitimate browsers send standard user-agents. Attackers using scripted tools leave distinctive user-agents: `Go-http-client`, `python-requests`, `curl`, `wget`, `PowerShell`, `Java`. A non-browser user-agent POSTing to internal services is high-confidence attacker activity.
+
+3. **CONNECT tunneling**: HTTP CONNECT establishes a tunnel through a proxy. Attackers use this to reach C2 servers through a compromised internal host. The Host header in a CONNECT request reveals the true destination.
+
+4. **Anomalous Host headers**: If the Host header in an HTTP request contains an RFC-reserved IP (127.x.x.x, 192.0.2.x, 198.51.100.x, 203.0.113.x) or an internal IP being accessed through an unexpected path, it reveals the attacker's network topology.
+
+If `grep_count(http.log, "wsman") > 0`, follow up with:
+```json
+{"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "wsman", "max_results": 20}}
+```
+Record the source IP, destination, user-agent, and status code.
+
+**Action required — severity depends on source IP:**
+- If the source is **external** (not RFC-1918: not 10.x, 172.16-31.x, 192.168.x): this is remote command execution initiated from outside — record a **CRITICAL finding** titled "External WinRM Access Detected" (mitre_tactic: "Initial Access", mitre_id: "T1133") citing the count, source IPs, destination host, and user-agent. Do NOT merge this with a general "External HTTP Access" finding — they are separate evidence classes.
+- If the source is **internal** (workstation → DC or other internal host): this is lateral movement via WinRM — record a HIGH finding (mitre_id: "T1021.006").
+
+Also scan for suspicious user-agents in the http.log results. If you see `Go-http-client`, `curl`, `python-requests`, `wget`, `PowerShell`, or other non-browser strings in requests to internal hosts, record a MEDIUM finding "Suspicious HTTP User-Agents Detected" (mitre_tactic: "Command and Control", mitre_id: "T1071.001") listing the user-agent strings, source IPs, and targeted endpoints.
 
 ### 3E — C2 and Tunneling
 ```json
 {"name": "read_log_head", "arguments": {"log_name": "socks.log", "n": 30}}
 ```
-```json
-{"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "CONNECT"}}
-```
-Identify the SOCKS pivot host and any HTTP CONNECT tunneling.
+
+Identify the SOCKS pivot host. Look for: which internal host is acting as both source and destination (pivot), how many unique source→destination pairs exist, and whether the SOCKS connections show a chain (A→B→C) that obscures the true origin. Record any new pivot hosts not already in macro findings.
 
 ### 3F — SMB Staging and Payloads
 ```json
@@ -132,9 +207,20 @@ Identify the SOCKS pivot host and any HTTP CONNECT tunneling.
 ```json
 {"name": "read_log_head", "arguments": {"log_name": "pe.log", "n": 20}}
 ```
-Identify specific executable filenames staged over SMB. Record tool names (mimikatz, psexec, etc.) as IOC filename entries.
 
-In the pe.log output, inspect the `sections` field for unusual PE section names. The `.retplne` section is a known Lynx ransomware packer indicator — if present, record it as a CRITICAL finding with `record_finding` (mitre_tactic: "Defense Evasion", mitre_id: "T1027").
+**Forensic reasoning on SMB file staging:**
+Extension matching alone misses most staging activity. A forensic analyst looks at three signals:
+
+1. **Known tool names** — search for attacker tooling by name regardless of extension:
+```json
+{"name": "grep_log", "arguments": {"log_name": "smb_files.log", "pattern": "hfs|winscp|filezilla|rclone|psexec|mimikatz|nc\\.exe|ncat", "max_results": 20}}
+```
+
+2. **File size** — large files (> 1 MB) staged over SMB are significant. The `size` field in smb_files.log contains the byte count. A 1 GB file is a deployment package (RMM, ransomware, backup tools). Use `grep_log` with a size threshold if specific large files need investigation.
+
+3. **Staging server identity** — which internal host is the *destination* of the most SMB file activity? That host is likely the software distribution/staging server used by the attacker. Note its IP.
+
+For pe.log: inspect the `sections` field for non-standard PE section names. Standard Windows PE sections are: `.text`, `.rdata`, `.data`, `.rsrc`, `.reloc`, `.bss`, `.idata`, `.edata`, `.pdata`, `.debug`. Any section name outside this set (especially short random names, names with special characters, or names matching known packer signatures) warrants a CRITICAL finding (mitre_tactic: "Defense Evasion", mitre_id: "T1027").
 
 ### 3G — Lateral Movement Scope
 ```json
@@ -143,7 +229,15 @@ In the pe.log output, inspect the `sections` field for unusual PE section names.
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "dce_rpc.log", "field": "id.orig_h", "n": 10}}
 ```
-How many unique internal hosts were accessed via SMB? Which host performed the most SAMR enumeration?
+
+**Forensic reasoning on DCE-RPC results:**
+Servers and Domain Controllers legitimately generate high DCE-RPC traffic as part of their normal role (handling requests from clients). High DCE-RPC volume *from* a server/DC is expected and is not an anomaly.
+
+The suspicious signal is a *client or workstation* appearing as a top source of DCE-RPC operations, particularly SAMR operations (account/group enumeration). When reviewing the top-N results:
+- IPs you identified as DCs or servers in the network environment: high DCE-RPC volume is normal
+- IPs identified as workstations: high DCE-RPC volume toward DCs is anomalous — this is automated AD enumeration
+
+Only flag DCE-RPC sources as enumeration findings if the source is a client/workstation or an unrecognised host, not if it is a DC performing its normal function.
 
 ### 3H — DNS Anomaly Survey
 ```json
@@ -155,7 +249,20 @@ Review the top DNS queries for unusual domains that do not match normal enterpri
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "ssl.log", "field": "server_name", "n": 30}}
 ```
-Review SSL server names (SNI) for connections to unusual external hosts. Flag any that look like C2 (random subdomains, dynamic DNS, or known malicious patterns). Cross-reference against the DNS anomalies found in 3H.
+
+**Forensic reasoning:**
+Review SSL server names (SNI) for two categories of anomaly:
+
+1. **Suspicious external domains** — random-looking subdomains, dynamic DNS providers (.ddns.net, .ngrok.io, .duckdns.org), or domains matching C2 patterns. Cross-reference against DNS anomalies from 3H.
+
+2. **RFC-reserved or impossible IPs as SNI** — if the SSL `server_name` field contains an IP address (rather than a hostname), and that IP falls in an RFC-reserved range, this is a strong C2 indicator:
+   - `127.0.0.0/8` — loopback appearing in production SSL means a NATted proxy setup
+   - `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` — TEST-NET ranges (RFC 5737) legitimately never appear in production traffic
+   - `10.x`, `172.16-31.x`, `192.168.x.x` — private IPs as SSL SNI may indicate split-tunnel C2
+
+   When legitimate software uses `198.51.100.x` as an SSL server name, it is almost always a NAT/proxy situation where the attacker's real infrastructure is behind an intermediary and the internal address leaks into the SSL handshake. Record as CRITICAL: the host making these connections is compromised and communicating with attacker-controlled infrastructure, and the traffic cannot be inspected (TLS 1.3).
+
+If any anomalous SSL SNI was found — record a finding (not just an IOC) citing the number of sessions, the internal source host(s), and the observed SNI value.
 
 ---
 
@@ -172,13 +279,16 @@ Use `record_timeline_event` for key events (first exfil DNS query, first success
 Call `mark_investigation_complete` only after ALL Phase 3 tasks are done.
 
 Before calling it, verify you have answered:
-- Which external IP had the most RDP sessions?
-- Were temp.sh / transfer.sh / korsan.me seen in DNS or SSL logs?
-- Which domain accounts were compromised (successful auth after failures)?
+- Which external IP is the most likely *targeted* attacker (cross-referenced against anomaly logs and auth success patterns — not just highest session count)?
+- Did Patient Zero appear as a *source* in ntlm.log with successful authentications to 5+ unique internal hosts? If YES → a CRITICAL "NTLM Lateral Movement" finding must exist (not just an IOC).
+- Were any file-sharing, exfiltration, or C2 domains seen in DNS or SSL logs? (Check both known IOC domains and novel domains from 3H/3I)
+- Were there WinRM (POST /wsman) requests in http.log from **external** source IPs? If YES → a CRITICAL "External WinRM Access Detected" finding must exist (not merged into general HTTP findings).
+- Were there HTTP CONNECT tunneling requests in http.log? If YES → a HIGH/CRITICAL "HTTP CONNECT Tunneling" finding must exist.
+- Were there non-browser user-agents (Go-http-client, curl, etc.) in http.log? If YES → a MEDIUM "Suspicious HTTP User-Agents" finding must exist.
 - Which internal host acted as the SOCKS pivot?
-- What specific executables were staged via SMB?
-- Were there suspicious DNS queries or SSL server names indicating C2?
-- Was the .retplne PE section (Lynx indicator) present?
+- What specific executables or large files were staged via SMB? Which host was the staging server?
+- Were any RFC-reserved IPs (TEST-NET, loopback) appearing as SSL SNI or HTTP Host headers? If so, a finding (not just an IOC) must be recorded.
+- Were any unusual PE section names present in pe.log?
 
 ---
 
@@ -209,6 +319,7 @@ Every finding MUST cite a specific log file. Never invent IPs, timestamps, count
 - T1059.001: Command and Scripting Interpreter: PowerShell
 - T1484.001: Domain Policy Modification: Group Policy Modification
 - T1105: Ingress Tool Transfer
+- T1071.001: Application Layer Protocol: Web Protocols
 
 Do NOT guess technique IDs. If unsure, omit the ID.
 

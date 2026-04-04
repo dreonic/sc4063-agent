@@ -89,6 +89,25 @@ def build_state_tools(state_ref: dict[str, Any]):
         if err:
             return f"REJECTED: {err}"
 
+        # Dedup: reject if a finding from the same log with a very similar title
+        # already exists (catches micro-tool re-recording of macro findings).
+        title_norm = title.lower().strip()
+        for existing in ref["findings"]:
+            if existing.get("evidence_log") == evidence_log:
+                existing_title_norm = existing.get("title", "").lower().strip()
+                # Titles are duplicates if one contains the other or they share
+                # >70% of words (handles minor rephrasing).
+                t_words = set(title_norm.split())
+                e_words = set(existing_title_norm.split())
+                if t_words and e_words:
+                    overlap = len(t_words & e_words) / max(len(t_words), len(e_words))
+                    if overlap >= 0.7:
+                        return (
+                            f"DUPLICATE: A finding for '{existing['title']}' "
+                            f"(id={existing['id']}) already exists from {evidence_log}. "
+                            "Do NOT record duplicate findings. Only record genuinely new evidence."
+                        )
+
         _finding_counter[0] += 1
         finding_id = f"MI-{_finding_counter[0]:03d}"
 

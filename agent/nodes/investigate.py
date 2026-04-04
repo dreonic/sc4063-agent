@@ -627,35 +627,6 @@ def investigate_node(state: ForensicState) -> dict:
             messages.append(_HM(content=_ingest_nudge_text))
             _recent_tool_names.clear()
 
-        # get_time_range loop: called >= 2 times without acting on the result
-        elif (
-            _representative_pcaps
-            and _recent_tool_names.count("get_time_range") >= 2
-            and "ingest_pcap" not in _recent_tool_names
-            and "list_pcap_files" not in _recent_tool_names
-        ):
-            from langchain_core.messages import HumanMessage as _HM
-            print("    [LOOP DETECTED] get_time_range called repeatedly — injecting nudge")
-            _untried = [f for f in _representative_pcaps if f not in _ingested_pcaps]
-            if _untried:
-                # Coverage still inadequate — push toward ingestion
-                _next_file = _untried[0]
-                messages.append(_HM(content=(
-                    f"STOP calling get_time_range. Coverage check is done.\n"
-                    f"You still have {len(_untried)} date group(s) to ingest. "
-                    f"Call ingest_pcap now:\n"
-                    f'{{"name": "ingest_pcap", "arguments": {{"pcap_filename": "{_next_file}"}}}}'
-                )))
-            else:
-                # All groups ingested — coverage is as good as it gets, move on
-                messages.append(_HM(content=(
-                    "STOP calling get_time_range. All date groups have been ingested. "
-                    "Coverage is adequate for this dataset. "
-                    "Proceed to Phase 2 macro analysis NOW:\n"
-                    '{"name": "run_initial_access_analysis", "arguments": {}}'
-                )))
-            _recent_tool_names.clear()
-
         # record_timeline_event / record_ioc loop: pure recording with no analysis
         elif _recent_tool_names.count("record_timeline_event") >= 3:
             from langchain_core.messages import HumanMessage as _HM
