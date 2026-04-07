@@ -221,6 +221,31 @@ def build_micro_tools(
         return f"Top {n} values for '{field}' in {log_name}:\n" + "\n".join(lines)
 
     @tool
+    def top_n_values_filtered(log_name: str, filter_field: str, filter_value: str, count_field: str, n: int = 10) -> str:
+        """Return the top N most common values for count_field, restricted to records where filter_field equals filter_value.
+
+        Example use: find the top source IPs (id.orig_h) that connected to a specific destination host (id.resp_h),
+        e.g. top_n_values_filtered('rdp.log', 'id.resp_h', '10.1.2.3', 'id.orig_h', 20).
+        This is more precise than grep_count per candidate because it scans the whole log once.
+        """
+        import re as _re
+        rdr = _reader(log_dir, log_name)
+        records = rdr.read_full()
+        filtered = [r for r in records if r.get(filter_field) == filter_value]
+        if not filtered:
+            return (
+                f"top_n_values_filtered: no records in {log_name} where {filter_field}={filter_value!r}. "
+                "Check the field name and value (exact match required)."
+            )
+        top = stats_mod.top_n(filtered, count_field, n)
+        lines = [f"  {val}: {cnt}" for val, cnt in top]
+        header = (
+            f"Top {n} values for '{count_field}' in {log_name} "
+            f"where {filter_field}={filter_value!r} ({len(filtered)} matching records):"
+        )
+        return header + "\n" + "\n".join(lines)
+
+    @tool
     def get_time_range(log_name: str) -> str:
         """Get the earliest and latest timestamp in a Zeek log file. Each log may be queried at most twice — act on the result immediately rather than re-checking."""
         _get_time_range_call_count[log_name] = _get_time_range_call_count.get(log_name, 0) + 1
@@ -288,6 +313,7 @@ def build_micro_tools(
         find_auth_successes,
         count_by_field,
         top_n_values,
+        top_n_values_filtered,
         get_time_range,
     ]
 

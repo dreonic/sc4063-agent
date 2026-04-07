@@ -62,6 +62,46 @@ def _estimate_tokens_from_text(text: str) -> int:
     return max(1, (len(text) + CHARS_PER_TOKEN_ESTIMATE - 1) // CHARS_PER_TOKEN_ESTIMATE)
 
 
+def _derive_capture_window(log_dir: str) -> str:
+    """Read the first and last timestamps from conn.log (or rdp.log as fallback)
+    to produce an accurate capture window string like '2025-11-18 – 2026-01-30'."""
+    import datetime, os
+    for logname in ("conn.log", "rdp.log", "dns.log"):
+        path = Path(log_dir) / logname if log_dir else None
+        if not path or not path.exists():
+            continue
+        try:
+            first_ts = last_ts = None
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("#"):
+                        continue
+                    try:
+                        first_ts = float(line.split("\t", 1)[0])
+                        break
+                    except ValueError:
+                        pass
+            # Last timestamp: read tail of file
+            size = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                fh.seek(max(0, size - 8192))
+                tail = fh.read().decode("utf-8", errors="replace")
+            for line in reversed(tail.splitlines()):
+                if line and not line.startswith("#"):
+                    try:
+                        last_ts = float(line.split("\t", 1)[0])
+                        break
+                    except ValueError:
+                        pass
+            if first_ts and last_ts:
+                t0 = datetime.datetime.utcfromtimestamp(first_ts).strftime("%Y-%m-%d")
+                t1 = datetime.datetime.utcfromtimestamp(last_ts).strftime("%Y-%m-%d")
+                return f"{t0} – {t1}"
+        except Exception:
+            continue
+    return ""
+
+
 def _extract_usage_tokens(response) -> tuple[int, int]:
     """Extract input/output token counts across common response schemas."""
     usage_candidates: list[dict] = []
@@ -196,6 +236,10 @@ def report_node(state: ForensicState) -> dict:
     except Exception as e:
         print(f"[REPORT] LLM summary failed ({e}), using deterministic summary.")
 
+    # Derive capture window from actual log timestamps (not timeline events,
+    # which may start later than the first logged packet).
+    capture_window = _derive_capture_window(state.get("log_dir", ""))
+
     # Build the report object
     report = ForensicReport(
         findings=findings,
@@ -211,6 +255,7 @@ def report_node(state: ForensicState) -> dict:
         kill_chain_phases=state.get("kill_chain_phases", []),
         cost_metrics=cost_metrics,
         investigation_notes=state.get("investigation_notes", []),
+        capture_window=capture_window,
     )
 
     # Generate and save

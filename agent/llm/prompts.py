@@ -69,23 +69,113 @@ Work through each task in order. For each task, call the tool and record what yo
 
 ### 3A — Initial Access: Identify Primary Attacker IP
 
-Start with the volume-based view:
+**Step 1 — Volume view:** get the top external IPs by RDP session count.
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "rdp.log", "field": "id.orig_h", "n": 20}}
 ```
 
-Then check the anomaly/alert log if it exists:
+**Step 2 — Cross-log presence check (the key discriminator):**
+
+Mass internet scanners touch exactly one protocol and disappear. A targeted attacker follows a kill chain — they appear in multiple log types because they do more than just knock on ports.
+
+Take the **top 5 external IPs** from Step 1 and check EVERY one against http.log and ntlm.log. You must run all 10 checks before drawing conclusions — do not stop early after checking only 1–2 IPs.
+
 ```json
-{"name": "read_log_head", "arguments": {"log_name": "dpd.log", "n": 50}}
+{"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "<external_ip_1>"}}
+```
+```json
+{"name": "grep_count", "arguments": {"log_name": "ntlm.log", "pattern": "<external_ip_1>"}}
 ```
 
-**Forensic reasoning — do not skip this step:**
-The IP with the most sessions in rdp.log is often a mass internet scanner, not the targeted attacker. A true targeted attacker typically:
-- Appears in filtered anomaly logs (dpd.log, notice.log) that flag protocol violations or unusual behaviour
-- Uses a small number of *authenticated* sessions (HYBRID/NLA success) rather than thousands of probe connections
-- May appear in multiple logs (rdp + dns + ssl + http) as a single cohesive actor
+Repeat for all 5 candidates (10 grep_count calls total).
 
-Cross-reference the top session-count IPs against any anomaly logs. If dpd.log or notice.log contains external IPs connecting to the same service port with protocol anomalies, those are higher-confidence targeted attacker candidates than raw session volume. Record the best-evidence attacker IP as an IOC.
+**Critical signal weighting — read this before interpreting results:**
+
+- **http.log presence is the strongest discriminator.** RDP uses TLS/CREDSSP for network-level authentication (NLA), which means every RDP connection attempt — including from mass scanners — produces SSL negotiation. Therefore, ssl.log presence alone does NOT distinguish an attacker from a scanner. http.log is different: scanners do not send HTTP POST requests to internal hosts. Any external IP appearing in http.log was doing something beyond port scanning (HTTP CONNECT tunneling, WinRM, web exploitation).
+- **ntlm.log presence** confirms the IP authenticated using NTLM — scanners that fail NLA before NTLM are invisible here. An external IP in ntlm.log successfully authenticated.
+- An IP that appears in **both rdp.log and http.log** (or rdp.log and ntlm.log) is the targeted attacker. An IP in rdp.log only — even with ssl.log hits — may still be a scanner.
+
+**Step 3 — Protocol anomaly check:**
+
+Zeek's Dynamic Protocol Detection (DPD) engine flags connections where the traffic does not match the expected protocol for that port — for example, an SSL/TLS handshake that fails or contains malformed version bytes on the RDP port. This is a precise attacker signal: mass scanners connect and disconnect cleanly, but an attacker tunneling non-RDP traffic over port 3389 will trigger protocol analyzer failures.
+
+Check all three DPD log locations (the data is the same signal, stored differently across Zeek versions):
+
+```json
+{"name": "grep_log", "arguments": {"log_name": "analyzer.log", "pattern": "3389", "max_results": 50}}
+```
+```json
+{"name": "grep_log", "arguments": {"log_name": "dpd.log", "pattern": "3389", "max_results": 50}}
+```
+```json
+{"name": "grep_log", "arguments": {"log_name": "weird.log", "pattern": "data_before_established", "max_results": 30}}
+```
+
+**Log version notes:**
+- `analyzer.log` — Zeek 7.2+: protocol analyzer failures are recorded here. Fields include `id.orig_h`, `id.resp_h`, `id.resp_p`, and `failure_reason`. This is the primary source on modern Zeek.
+- `dpd.log` — Zeek < 7.2: same data, different log name. Check if present.
+- `weird.log` / `data_before_established` — supplementary fallback for connection-state anomalies.
+
+Any external IP appearing in analyzer.log or dpd.log with a failure on port 3389 was running non-standard traffic over the RDP port. This is a targeted attacker signal — record it as HIGH/CRITICAL IOC immediately.
+
+**Step 4 — Fallback if top-5 are all scanners:**
+
+If all top-5 external IPs from Step 1 have zero hits in http.log and ntlm.log, do NOT conclude "no targeted attacker." The attacker may have fewer total RDP sessions than mass scanners but still be the most dangerous IP. In this case, reverse the search:
+
+```json
+{"name": "top_n_values", "arguments": {"log_name": "http.log", "field": "id.orig_h", "n": 20}}
+```
+
+Filter the result for external IPs (anything not in 10.x, 172.16-31.x, 192.168.x). Any external IP appearing in http.log is a targeted actor — scanners never send HTTP requests to internal services. For each external IP found:
+- Note which endpoints it contacted (wsman = WinRM, CONNECT = tunneling)
+- Cross-reference back to rdp.log: did it also appear there?
+
+The attacker IP is the external IP present in http.log (and optionally rdp.log), even if it ranks low in RDP session volume.
+
+**Action:** Record the best-evidence targeted attacker IP as a CRITICAL IOC. If it came from the fallback http.log search, note that it was not in the top RDP sources by volume but was identified by application-layer activity.
+
+**Step 5 — RDP session authenticity filter (catches low-count targeted attackers):**
+
+Volume-based ranking systematically under-ranks targeted attackers. A skilled attacker makes exactly as many RDP connections as needed — often fewer than 30. A mass scanner may generate thousands. Ranking by count hides the attacker behind noise.
+
+The RDP protocol includes an optional cookie in the X.224 Connection Request PDU. Most legitimate Windows RDP clients (mstsc.exe and compatible tools) populate this field with `mstshash=<username>`. Mass internet scanners and automated probes typically do not — they either omit the cookie or send a generic placeholder. Zeek captures this in the `cookie` field of rdp.log.
+
+```json
+{"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "mstshash=", "max_results": 50}}
+```
+
+Each result row is a genuine human-operated RDP client connection. Extract the source IPs (`id.orig_h` column) from the results. These are all real clients — some may be legitimate IT, others may be the attacker. Cross-reference against internal subnet ranges (10.x, 172.16-31.x, 192.168.x); any external IP in this set is a targeted actor.
+
+**Step 6 — Patient Zero inbound connections (MANDATORY — do not skip):**
+
+The macro tools (Phase 2) identify Patient Zero as part of baseline analysis. By this point you have its IP. Now find the top external sources by session count that targeted Patient Zero specifically.
+
+Use `top_n_values_filtered` to get a ranked count of every external source IP that connected specifically to Patient Zero's RDP port — this scans the full log and returns exact counts, not a truncated sample:
+
+```json
+{"name": "top_n_values_filtered", "arguments": {"log_name": "rdp.log", "filter_field": "id.resp_h", "filter_value": "<patient_zero_ip>", "count_field": "id.orig_h", "n": 20}}
+```
+
+This returns the top 20 external IPs by session count to Patient Zero specifically — volume-ranked, not truncated. The highest-count external IP on this list is the primary attacker. An IP that appears hundreds of times exclusively targeting one internal host is maintaining persistent access, not scanning.
+
+After identifying the top candidate, confirm the cookie value to distinguish real client from scanner:
+```json
+{"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "<top_candidate_ip>", "max_results": 5}}
+```
+Note the `cookie` field — `mstshash=<name>` is a real Windows client; a generic word like `hello` is a scanner placeholder; any short non-generic value is also a real RDP client.
+
+**Key interpretation rule:** The external IP with the highest session count to Patient Zero (from `top_n_values_filtered`) is the primary attacker. Record it as a CRITICAL IOC citing the session count as evidence of targeted persistent access.
+
+**RDP authentication method:** Also note the `security_protocol` field from the attacker's sessions. `HYBRID` means Network Level Authentication (NLA) was negotiated — the attacker presented valid credentials before the RDP session was established, not during it. This is forensically significant: NLA-authenticated sessions indicate the attacker possessed valid credentials (whether stolen, purchased, or brute-forced) rather than exploiting an unauthenticated vulnerability. Note this explicitly in the Initial Access finding.
+
+**This step is not optional.** Do not rely solely on top-N volume rankings to identify the primary attacker. The only reliable method is to enumerate who actually reached the compromised host and how persistently they returned.
+
+**Synthesis rule — attacker IP confidence tiers:**
+- **CRITICAL confidence**: IP present in Step 6 list (connected to Patient Zero) AND appears in http.log or ntlm.log
+- **HIGH confidence**: IP present in Step 6 list with high session count exclusively to Patient Zero (targeted persistence reconnection)
+- **HIGH confidence (alt)**: IP found via mstshash= cookie in rdp.log (real Windows client) AND connected to Patient Zero
+- **MEDIUM confidence**: IP found only via http.log (application-layer activity, no confirmed RDP)
+- **Scanner/noise**: IP never connects to Patient Zero specifically, cookie is a generic placeholder (e.g. `hello`), sessions distributed across many internal hosts
 
 ### 3B — Initial Access: Confirm Attack Timeline
 Call these tools:
@@ -96,6 +186,8 @@ Call these tools:
 {"name": "get_time_range", "arguments": {"log_name": "conn.log"}}
 ```
 Confirm the earliest and latest timestamps. Note whether the attack spans days or weeks.
+
+**Temporal synthesis (mandatory):** After recording the timestamps, immediately call `record_finding` with title "Attack Dwell Time Analysis", severity HIGH. In the summary field, include: (1) total dwell time in days (last_ts minus first external RDP/WinRM timestamp), (2) whether privilege escalation appeared within 48 hours of initial access (short gap = attacker had valid credentials or escalated rapidly), (3) how many distinct exfiltration episodes occurred (single cluster vs. multiple separated by days = staged double-extortion). Compute these from the get_time_range outputs you already have. Do NOT output this as prose — call `record_finding` directly.
 
 ### 3C — Credential Abuse: Account Targeting
 Call these tools one at a time:
@@ -147,6 +239,8 @@ Known exfiltration service patterns to check in dns.log and ssl.log:
 ```
 
 **Forensic reasoning:** Any count > 0 for an external file-sharing or C2 domain is significant. Follow up with `grep_log` to retrieve the actual records — note the querying internal hosts, timestamps, and resolved IPs. A small number of DNS lookups to a file-sharing service (2–20) followed by TLS sessions to the resolved IP is the classic exfiltration pattern. Record as CRITICAL if confirmed.
+
+**Exfiltration timing analysis:** If an exfiltration domain is confirmed, use `grep_log` to retrieve timestamps and note whether activity is in a single cluster or spread across multiple distinct time periods separated by days. Include this in the exfiltration finding — multiple separated episodes indicate staged data theft (double-extortion: steal data first, encrypt later).
 
 Also check http.log for CONNECT tunneling to any C2 domains found:
 ```json
@@ -204,9 +298,6 @@ Identify the SOCKS pivot host. Look for: which internal host is acting as both s
 ```json
 {"name": "grep_log", "arguments": {"log_name": "smb_files.log", "pattern": "\\.exe", "max_results": 30}}
 ```
-```json
-{"name": "read_log_head", "arguments": {"log_name": "pe.log", "n": 20}}
-```
 
 **Forensic reasoning on SMB file staging:**
 Extension matching alone misses most staging activity. A forensic analyst looks at three signals:
@@ -216,11 +307,29 @@ Extension matching alone misses most staging activity. A forensic analyst looks 
 {"name": "grep_log", "arguments": {"log_name": "smb_files.log", "pattern": "hfs|winscp|filezilla|rclone|psexec|mimikatz|nc\\.exe|ncat", "max_results": 20}}
 ```
 
-2. **File size** — large files (> 1 MB) staged over SMB are significant. The `size` field in smb_files.log contains the byte count. A 1 GB file is a deployment package (RMM, ransomware, backup tools). Use `grep_log` with a size threshold if specific large files need investigation.
+2. **File size and purpose** — large files (> 1 MB) staged over SMB are significant. The `size` field in smb_files.log contains the byte count. Classify large files by their likely purpose based on name and size:
+   - Files named after RMM tools (ManageEngine, ConnectWise, Kaseya, AnyDesk, etc.) in the 100 MB–2 GB range: mass endpoint management agents used for ransomware deployment across all domain hosts
+   - Files named after backup or recovery tools (RecoveryManager, BackupExec, Veeam, etc.): likely targeting backup infrastructure for destruction before encryption
+   - Files named with random strings, long domain-prefixed names, or `agent.exe` patterns in the 10–100 MB range: likely ransomware payload or backdoor installer
+   - Large compressed archives (.zip, .rar, .7z) staged to unusual hosts: data staging for exfiltration
+   For each large file found, state its name, size, destination host, and the most likely forensic interpretation of its purpose. This classification is essential for understanding the attacker's end-goal (ransomware deployment, backup destruction, exfiltration).
 
 3. **Staging server identity** — which internal host is the *destination* of the most SMB file activity? That host is likely the software distribution/staging server used by the attacker. Note its IP.
 
-For pe.log: inspect the `sections` field for non-standard PE section names. Standard Windows PE sections are: `.text`, `.rdata`, `.data`, `.rsrc`, `.reloc`, `.bss`, `.idata`, `.edata`, `.pdata`, `.debug`. Any section name outside this set (especially short random names, names with special characters, or names matching known packer signatures) warrants a CRITICAL finding (mitre_tactic: "Defense Evasion", mitre_id: "T1027").
+**PE binary section analysis** — do NOT use `read_log_head` for pe.log. PE files are logged as they are seen across the entire capture, and unusual binaries may appear anywhere in the timeline, not just at the start. Instead:
+
+```json
+{"name": "top_n_values", "arguments": {"log_name": "pe.log", "field": "section_names", "n": 20}}
+```
+
+This returns the most common PE section name combinations across all observed binaries. Review each result against the standard Windows PE section set: `.text`, `.rdata`, `.data`, `.rsrc`, `.reloc`, `.bss`, `.idata`, `.edata`, `.pdata`, `.debug`, `.tls`, `.xdata`, `.pdata`, `.gfids`. Any section name outside this set — especially short random names, all-uppercase names, names with special characters, or names not associated with known Microsoft compilers — indicates a packed, obfuscated, or custom-compiled executable.
+
+**Mandatory action:** If any non-standard section name appears in the top_n_values output, you MUST:
+1. Record a **HIGH finding** titled "Non-Standard PE Section Names Detected" (mitre_tactic: "Defense Evasion", mitre_id: "T1027")
+2. List the non-standard section names and the count of PE files containing them
+3. Note this is consistent with packed or custom-built attacker tooling
+
+Do not dismiss unusual section names as benign without evidence. Legitimate third-party software occasionally uses non-standard sections, but their presence in the context of an intrusion investigation is significant and must be documented.
 
 ### 3G — Lateral Movement Scope
 ```json
@@ -229,6 +338,26 @@ For pe.log: inspect the `sections` field for non-standard PE section names. Stan
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "dce_rpc.log", "field": "id.orig_h", "n": 10}}
 ```
+
+**Critical asset identification:** Beyond counting lateral movement sources, identify which internal hosts represent critical infrastructure. Check the SMB share paths accessed — these reveal host roles:
+```json
+{"name": "top_n_values", "arguments": {"log_name": "smb_mapping.log", "field": "path", "n": 30}}
+```
+Interpret the share paths:
+- `\\\\<host>\\SYSVOL` or `\\\\<host>\\NETLOGON` — this host is a **Domain Controller**. DC compromise is the highest-severity lateral movement event.
+- `\\\\<host>\\C$` or `\\\\<host>\\ADMIN$` — administrative share access; note whether the source is Patient Zero or an unexpected host
+- Shares containing "backup", "archive", "vault", "recovery" — this host stores backups; attacker access here precedes ransomware deployment to destroy recovery capability
+- Shares containing "software", "deploy", "dist", "packages" — software distribution server; used by attackers to mass-deploy ransomware via GPO or scheduled tasks
+
+Also check kerberos.log for service names that reveal host roles:
+```json
+{"name": "grep_log", "arguments": {"log_name": "kerberos.log", "pattern": "ldap|cifs/.*dc|krbtgt|GC/", "max_results": 20}}
+```
+- `ldap/<host>` — Domain Controller
+- `krbtgt` — the attacker requested a TGT for the Kerberos ticket-granting account, indicating complete domain compromise (Golden Ticket capability)
+- `GC/<host>` — Global Catalog server (high-value DC)
+
+**Mandatory action:** For each critical infrastructure host identified (DC, backup server, software distribution, CA), record it explicitly in the finding narrative. State which specific hosts were compromised, not just that "lateral movement occurred." The scope of compromise — particularly whether DCs and backup systems were reached — determines the business impact.
 
 **Forensic reasoning on DCE-RPC results:**
 Servers and Domain Controllers legitimately generate high DCE-RPC traffic as part of their normal role (handling requests from clients). High DCE-RPC volume *from* a server/DC is expected and is not an anomaly.
@@ -243,7 +372,19 @@ Only flag DCE-RPC sources as enumeration findings if the source is a client/work
 ```json
 {"name": "top_n_values", "arguments": {"log_name": "dns.log", "field": "query", "n": 30}}
 ```
-Review the top DNS queries for unusual domains that do not match normal enterprise patterns (e.g., .com/.net with random-looking names, dynamic DNS providers, or domains consistent with C2 beaconing). Record any suspicious domains as IOCs with `record_ioc` (type: domain).
+Review the top DNS queries for unusual domains that do not match normal enterprise patterns (e.g., random-looking names, dynamic DNS providers, non-standard TLDs, or domains consistent with C2 beaconing).
+
+**Two actions are required — do both:**
+
+1. **Record IOCs** — use `record_ioc` (type: domain) for every suspicious domain found.
+
+2. **Record a finding** — a suspicious domain appearing in the top-30 DNS queries is not just an IOC: it has anomalously high query volume relative to the entire investigation. High, sustained query frequency to a single unusual domain is the hallmark of periodic C2 check-in (beaconing). This requires a formal finding:
+   - Use `record_finding` titled "Suspicious High-Volume DNS Activity" (mitre_tactic: "Command and Control", mitre_id: "T1071.004")
+   - Severity: HIGH if the domain is simply unusual; CRITICAL if it is already known as a C2 domain or if query volume rivals legitimate internal services
+   - Cite the domain names, their query counts (from the top_n_values output), and the querying internal host(s) (follow up with `grep_log` on dns.log for the domain to retrieve source IPs)
+   - Do not merge this into an exfiltration finding — beaconing and exfiltration are distinct behaviors requiring separate findings
+
+If the top-30 DNS queries consist entirely of well-known legitimate domains (e.g., Windows Update, CDNs, public cloud services), no finding is needed — note that no anomalies were found and move on.
 
 ### 3I — SSL/TLS Certificate Anomalies
 ```json
@@ -264,6 +405,53 @@ Review SSL server names (SNI) for two categories of anomaly:
 
 If any anomalous SSL SNI was found — record a finding (not just an IOC) citing the number of sessions, the internal source host(s), and the observed SNI value.
 
+### 3J — Software and Service Fingerprinting
+
+If `software.log` is present in the log inventory, do NOT just read the head — the log is sorted by time and tools of interest may appear anywhere. Instead, search for each forensic category using targeted greps:
+
+**Search 1 — Remote access and remote desktop software:**
+```json
+{"name": "grep_log", "arguments": {"log_name": "software.log", "pattern": "VNC|Remote.Desktop|RDP|AnyDesk|TeamViewer|ScreenConnect|Remote.Admin|WicaAgent|RemotePC|Splashtop|LogMeIn|GoToMyPC|DameWare|NetSupport", "max_results": 20}}
+```
+
+**Search 2 — Offensive and dual-use tooling:**
+```json
+{"name": "grep_log", "arguments": {"log_name": "software.log", "pattern": "netcat|ncat|Metasploit|Meterpreter|CobaltStrike|mimikatz|PsExec|Impacket|Empire|PowerSploit|BloodHound|SharpHound", "max_results": 20}}
+```
+
+**Search 3 — External recon / IP-discovery tools:**
+```json
+{"name": "grep_log", "arguments": {"log_name": "software.log", "pattern": "getip|ipinfo|whatismyip|checkip|myip|icanhazip|ipecho|ipify|Comae", "max_results": 20}}
+```
+
+**Forensic reasoning:**
+Zeek's software detection engine passively fingerprints active software from network traffic (HTTP User-Agent headers, TLS handshakes, banner grabbing). `read_log_head` alone is unreliable for this log — entries are in chronological order and attacker-installed tools appear when first used, not at capture start. Targeted greps across the full log surface evidence that a head-read would miss.
+
+The three categories are forensically significant:
+
+1. **Remote access tools** — not standard enterprise software. An unexpected remote desktop or remote control tool on a workstation indicates attacker-installed persistence. The attacker can reconnect at will using this tool even if the original RDP session is blocked.
+
+2. **Offensive tooling** — direct evidence of attacker tradecraft on a host. Any hit here is CRITICAL.
+
+3. **IP-discovery tools** — attackers frequently check their external egress IP after pivoting to confirm they are routing through the right path. A tool making repeated HTTP calls to external IP-lookup services from an internal workstation is post-pivot recon behavior.
+
+**Mandatory action rules — do not skip:**
+
+- If Search 1 returns any result on a host not identified as a dedicated management/admin server: record a **HIGH finding** titled "Unexpected Remote Access Tool Detected" (mitre_tactic: "Persistence", mitre_id: "T1133") citing the software name, host IP, and first-seen timestamp. Add the host as an IOC. Do not dismiss this as routine — remote access tools are a primary attacker persistence mechanism.
+
+- If Search 2 returns any result: record a **CRITICAL finding** titled "Attacker Offensive Tooling Detected" citing the tool name, host IP, and timestamp.
+
+- If Search 3 returns any result: record a **MEDIUM finding** titled "External IP Reconnaissance via Software Tool" (mitre_id: "T1016") listing the tool name and the internal hosts performing the lookups. Add those hosts as IOCs.
+
+If all three searches return no results, note that and move on.
+
+If `known_services.log` is present, check for unexpected service exposure:
+```json
+{"name": "read_log_head", "arguments": {"log_name": "known_services.log", "n": 50}}
+```
+
+A workstation (non-server IP) running HTTP/HTTPS (port 80/443/8080/8443) or offering listening services on unusual ports indicates an attacker-deployed server (e.g., a lightweight file server, reverse shell listener, or HTTP handler) or a backdoor. Cross-reference any unexpected service hosts against IPs already flagged as suspicious. If found, record a HIGH finding "Unexpected Listening Service on Workstation" (mitre_id: "T1071.001").
+
 ---
 
 ## PHASE 4: RECORD NEW FINDINGS
@@ -279,16 +467,19 @@ Use `record_timeline_event` for key events (first exfil DNS query, first success
 Call `mark_investigation_complete` only after ALL Phase 3 tasks are done.
 
 Before calling it, verify you have answered:
-- Which external IP is the most likely *targeted* attacker (cross-referenced against anomaly logs and auth success patterns — not just highest session count)?
+- Which external IP is the most likely *targeted* attacker (cross-referenced against anomaly logs and auth success patterns — not just highest session count)? Was Step 6 (Patient Zero inbound grep on rdp.log) performed? If not, perform it now before completing.
 - Did Patient Zero appear as a *source* in ntlm.log with successful authentications to 5+ unique internal hosts? If YES → a CRITICAL "NTLM Lateral Movement" finding must exist (not just an IOC).
 - Were any file-sharing, exfiltration, or C2 domains seen in DNS or SSL logs? (Check both known IOC domains and novel domains from 3H/3I)
+- Did any suspicious domain from 3H appear in the top-30 DNS queries (anomalously high volume)? If YES → a "Suspicious High-Volume DNS Activity" finding (T1071.004) must exist — not just IOC records.
 - Were there WinRM (POST /wsman) requests in http.log from **external** source IPs? If YES → a CRITICAL "External WinRM Access Detected" finding must exist (not merged into general HTTP findings).
 - Were there HTTP CONNECT tunneling requests in http.log? If YES → a HIGH/CRITICAL "HTTP CONNECT Tunneling" finding must exist.
 - Were there non-browser user-agents (Go-http-client, curl, etc.) in http.log? If YES → a MEDIUM "Suspicious HTTP User-Agents" finding must exist.
 - Which internal host acted as the SOCKS pivot?
 - What specific executables or large files were staged via SMB? Which host was the staging server?
 - Were any RFC-reserved IPs (TEST-NET, loopback) appearing as SSL SNI or HTTP Host headers? If so, a finding (not just an IOC) must be recorded.
-- Were any unusual PE section names present in pe.log?
+- Was pe.log analyzed via `top_n_values` on the `section_names` field (not `read_log_head`)? If any non-standard section name appeared → a "Non-Standard PE Section Names Detected" finding (T1027) must exist.
+- Was software.log searched (grep, not just head-read) for remote-access tools, offensive tooling, and IP-discovery tools? If any hit → findings must be recorded.
+- Was known_services.log checked? Did any workstations expose unexpected listening services?
 
 ---
 
@@ -318,6 +509,7 @@ Every finding MUST cite a specific log file. Never invent IPs, timestamps, count
 - T1039: Data from Network Shared Drive
 - T1059.001: Command and Scripting Interpreter: PowerShell
 - T1484.001: Domain Policy Modification: Group Policy Modification
+- T1071.004: Application Layer Protocol: DNS
 - T1105: Ingress Tool Transfer
 - T1071.001: Application Layer Protocol: Web Protocols
 

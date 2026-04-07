@@ -5,6 +5,20 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Extra Zeek policy scripts loaded on top of the default base scripts.
+# software.log requires base/frameworks/software + per-protocol scripts.
+# dpd.log was removed in Zeek 7.2 (PR #4200); dpd_compat.zeek recreates it
+# for Zeek 8.x using the analyzer_failed event + AnalyzerViolationInfo API.
+_EXTRA_SCRIPTS = (
+    "base/frameworks/software "
+    "policy/protocols/http/software "
+    "policy/protocols/http/detect-webapps "
+    "policy/protocols/conn/known-hosts "
+    "policy/protocols/conn/known-services"
+)
+# dpd_compat.zeek lives two directories above this file's package root
+_DPD_COMPAT_SCRIPT = Path(__file__).parent.parent.parent / "dpd_compat.zeek"
+
 
 def run_zeek(pcap_path: str, output_dir: str) -> Path:
     """Run 'zeek -r <pcap>' to produce log files, then sort each by timestamp.
@@ -121,7 +135,11 @@ def run_zeek_on_directory(pcap_dir: str, output_dir: str) -> Path:
             # Use the full Zeek binary path since non-interactive WSL bash
             # does not load .bashrc/.profile and /opt/zeek/bin is not on PATH.
             zeek_bin = "/opt/zeek/bin/zeek"
-            full_command = ["wsl", "bash", "-c", f"cd '{cwd_arg}' && {zeek_bin} -r '{wsl_pcap}'"]
+            import os as _os
+            _dpd_full = str(_DPD_COMPAT_SCRIPT.resolve())
+            _dpd_drive, _dpd_tail = _os.path.splitdrive(_dpd_full)
+            wsl_dpd = f"/mnt/{_dpd_drive.replace(':', '').lower()}{_dpd_tail.replace(_os.sep, '/')}"
+            full_command = ["wsl", "bash", "-c", f"cd '{cwd_arg}' && {zeek_bin} -r '{wsl_pcap}' {_EXTRA_SCRIPTS} '{wsl_dpd}'"]
         else:
             full_command = command
 
@@ -219,7 +237,11 @@ def ingest_single_pcap(pcap_path: str, log_dir: str) -> dict[str, int]:
         drive2, tail2 = os.path.splitdrive(scratch_full)
         wsl_cwd = f"/mnt/{drive2.replace(':', '').lower()}{tail2.replace(os.sep, '/')}"
         zeek_bin = "/opt/zeek/bin/zeek"
-        command = ["wsl", "bash", "-c", f"cd '{wsl_cwd}' && {zeek_bin} -r '{wsl_pcap}'"]
+        import os as _os2
+        _dpd_full2 = str(_DPD_COMPAT_SCRIPT.resolve())
+        _dpd_drive2, _dpd_tail2 = _os2.path.splitdrive(_dpd_full2)
+        wsl_dpd2 = f"/mnt/{_dpd_drive2.replace(':', '').lower()}{_dpd_tail2.replace(_os2.sep, '/')}"
+        command = ["wsl", "bash", "-c", f"cd '{wsl_cwd}' && {zeek_bin} -r '{wsl_pcap}' {_EXTRA_SCRIPTS} '{wsl_dpd2}'"]
     else:
         command = ["zeek", "-r", pcap_full]
 
