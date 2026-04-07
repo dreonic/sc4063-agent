@@ -95,6 +95,25 @@ def _format_tool_catalog(tools: list) -> str:
     return "\n".join(lines) if lines else "  (no tools available)"
 
 
+def _strip_tool_call_tags(text: str) -> str:
+    """Remove <tool_call>...</tool_call> wrapper tags used by Qwen/Hermes models.
+
+    These models wrap the JSON payload in XML-style tags:
+      <tool_call>{"name": ...}</tool_call>
+    The tags themselves are not valid JSON and cause json.loads to fail.
+    Strip matched pairs, orphaned closing tags, and orphaned opening tags.
+    """
+    if not text:
+        return text
+    # Pattern 1: matched pair — keep the inner content
+    cleaned = re.sub(r"<tool_call>(.*?)</tool_call>", r"\1", text, flags=re.DOTALL)
+    # Pattern 2: orphaned closing tag — remove it
+    cleaned = cleaned.replace("</tool_call>", "")
+    # Pattern 3: orphaned opening tag — remove it
+    cleaned = cleaned.replace("<tool_call>", "")
+    return cleaned.strip()
+
+
 def _extract_tool_calls_from_text(content: str) -> list[dict]:
     """Parse tool calls from model text when native tool_call parsing fails.
 
@@ -103,6 +122,10 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
     """
     if not content:
         return []
+
+    # Strip <tool_call>...</tool_call> wrapper tags (Qwen/Hermes format) before
+    # any JSON extraction so trailing </tool_call> doesn't break json.loads.
+    content = _strip_tool_call_tags(content)
 
     candidates: list[str] = []
     for block in re.findall(r"```(?:json)?\n(.*?)\n```", content, re.DOTALL):

@@ -7,31 +7,28 @@
 | **Data Source** | Zeek Logs (from PCAP) |
 | **Internal Subnet** | 10.128.239.0/24 |
 | **Domain** | domain-ees3Ai.local |
-| **Report Generated** | 2026-04-07 14:07:38 UTC |
-| **Findings** | 27 |
+| **Report Generated** | 2026-04-07 15:29:31 UTC |
+| **Findings** | 28 |
 | **IOCs** | 289 |
 | **Timeline Events** | 81 |
 
 ## Executive Summary
 
-**Incident Overview**
-A sophisticated intrusion campaign compromised internal network infrastructure, enabling unauthorized remote access, lateral movement, and data exfiltration. The attack leveraged legitimate administrative protocols to evade detection.
+**Incident Overview:** A targeted intrusion campaign compromised internal infrastructure, enabling unauthorized remote access, lateral movement, and data exfiltration (MITRE ATT&CK T1041). Attackers utilized external RDP and WinRM protocols (T1021.001, T1021.002) to establish persistence. Traffic obfuscation was observed via SOCKS proxy chains and HTTP CONNECT tunneling to C2 domains (T1071).
 
-**Root Cause**
-Initial access was achieved through external Remote Desktop Protocol (RDP) and Windows Remote Management (WinRM) exploitation. Credential spraying attacks preceded the successful compromise of host 10.128.239.57 (Patient Zero) on 2025-11-18 13:30:23 UTC.
+**Root Cause:** Initial access was achieved through credential spraying and brute-force RDP attacks against external-facing services. The attacker IP 113.105.164.28 triggered RDP anomalies, while 185.147.124.48 initiated successful sessions. Patient Zero host 10.128.239.57 was compromised first via MITRE T1110.001.
 
-**Impact Scope**
-Compromise extended to 135+ internal targets via administrative share access (ADMIN$/C$) and NTLM authentication. Sensitive data was staged using tools including FileZilla and 7-Zip. Exfiltration occurred via encrypted channels to domains such as temp.sh. Kerberos TGTs were harvested, indicating potential domain-wide credential compromise.
+**Impact Scope:** Compromised systems include 10.128.239.57 and associated peers within the 10.128.239.x subnet. Affected accounts include IT1, APatton, and service accounts (jjjjjjjCA1$). Sensitive data was staged via SMB (43 .exe files, 2474 file records) and exfiltrated to external destinations (temp.sh, srv57c0d2365c3c.korsan.me).
 
-**Key Timeline**
-*   **Initial Access:** 2025-11-18 13:30:23 UTC (Patient Zero identified).
-*   **Lateral Movement:** Immediate escalation within 48 hours; 5,000 external RDP sessions detected.
-*   **Containment:** Activity ceased 2026-01-30 UTC (72.7-day dwell time).
+**Key Timeline:**
+*   2025-11-18 13:30:23 UTC: First evidence of compromise on 10.128.239.57.
+*   Subsequent: Lateral movement via NTLM/SAMR and WinRM detected.
+*   Detection: High-volume DNS and C2 traffic identified, triggering containment protocols.
 
-**Top 3 Immediate Recommendations**
-1.  **Network Isolation:** Immediately isolate compromised hosts (specifically 10.128.239.57) and block identified malicious IPs (e.g., 185.147.124.48, 141.98.11.96) at the perimeter.
-2.  **Credential Reset:** Force a global password reset and revoke all active Kerberos TGTs for affected accounts (e.g., APatton, IT1) to prevent further lateral movement.
-3.  **Endpoint Hardening:** Disable external RDP/WinRM access immediately and implement strict egress filtering to block C2 domains (e.g., korsan.me, temp.sh).
+**Top 3 Immediate Recommendations:**
+1.  **Network Isolation:** Immediately isolate compromised hosts (10.128.239.57, .34, .36) and block identified malicious IPs (113.105.164.28, 196.251.89.107) at the perimeter.
+2.  **Credential Reset:** Force password resets for all affected accounts (IT1, APatton) and service accounts; enforce MFA on RDP and WinRM.
+3.  **Forensic Imaging:** Preserve volatile memory and disk images of Patient Zero and staging servers (10.128.239.34) for legal proceedings and root cause analysis.
 
 ## Log Inventory
 
@@ -229,8 +226,8 @@ Compromise extended to 135+ internal targets via administrative share access (AD
 | Command and Control | Ingress Tool Transfer | `T1105` | 17 PE file(s): architectures={'I386': 8, 'AMD64': 9}, 17 with compile timestamps |
 | Defense Evasion | Domain Policy Modification: Group Policy Modification | `T1484.001` | 20000 GPO file access(es) by 60 host(s) |
 | Impact |  | `T1486` | 15 suspicious file pattern match(es) |
-| Defense Evasion | Obfuscated Files or Information | `T1027` | Section names: .text,.rdata,.data,.pdata,.retplne,.rsrc,.reloc (9 files); .text,.rdata,.data,.didat,... |
-| Command and Control | Application Layer Protocol | `T1071.004` | Top suspicious DNS queries: ant.typer.pl (24370), ilo.byper.pl (24341), hzh.0xox0x0x0.com (23978) |
+| Command and Control | Application Layer Protocol | `T1071.004` | Top DNS queries include ant.typer.pl (24370), ilo.byper.pl (24341), hzh.0xox0x0x0.com (23978) - all ... |
+| Defense Evasion | Obfuscated Files or Information | `T1027` | Top PE section names: .text,.rdata,.data,.pdata,.retplne,.rsrc,.reloc (9 files) and .text,.rdata,.da... |
 
 ## Detailed Findings
 
@@ -286,7 +283,7 @@ Patient Zero identified as 10.128.239.57 at 2025-11-18 13:30:23 UTC
 
 **Severity:** CRITICAL  
 
-Detected 43 .exe file(s) transferred over SMB. 35 file(s) exceed the 1048576-byte threshold. Staging server: 10.128.239.34. Unique executables: FileZilla_3.57.0_win64_sponsored-setup.exe, npp.8.4.9.Installer.x64.exe, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Microsoft\\Windows NT\\Audit\\audit.csv, hfs.exe, Software\\GeoServer-2.24.2-winsetup.exe, Shares\\administration\\Software\\ChromeSetup.exe, Setup.Def.en-us_O365ProPlusRetail_TX_PR_Platform_def_b_64_.exe, vc_redist.x64.exe, ManageEngine_PMP_64bit.exe, GeoServer-2.24.2-winsetup.exe.
+Detected 43 .exe file(s) transferred over SMB. 35 file(s) exceed the 1048576-byte threshold. Staging server: 10.128.239.34. Unique executables: GeoServer-2.24.2-winsetup.exe, ManageEngine_PMP_64bit.exe, SambaSetup5712.exe, delete.me, Wireshark-win64-4.0.4.exe, rpmelite_6.2.0.570_x64.exe, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Preferences\\Registry\\Registry.xml, ManageEngine_RMM_Server.exe, ManageEngine_RecoveryManagerPlus_Bundle.exe, hfs.exe.
 
 #### Evidence
 
@@ -298,36 +295,52 @@ Detected 43 .exe file(s) transferred over SMB. 35 file(s) exceed the 1048576-byt
 - **Lateral Movement** / Remote Services: SMB/Windows Admin Shares (`T1021.002`)
 
 
-### Finding MI-003: Suspicious High-Volume DNS Activity
+### Finding MI-001: RDP Protocol Anomaly — Targeted Attacker Identified
 
 **Severity:** CRITICAL  
 
-Multiple suspicious domains with anomalously high query volumes detected: ant.typer.pl (24370 queries), ilo.byper.pl (24341 queries), hzh.0xox0x0x0.com (23978 queries). These domains exhibit beaconing behavior consistent with C2 communication.
+External IP 113.105.164.28 triggered SSL protocol analyzer failures on RDP port 3389 with 'Invalid version late in TLS connection. Packet reported version: 0'. This indicates non-standard TLS traffic being tunneled through the RDP port, a targeted attacker signal. Mass scanners connect and disconnect cleanly; this anomaly indicates the attacker was tunneling non-RDP traffic through port 3389.
 
 #### Evidence
 
-**Source:** `dns.log`  
-Top suspicious DNS queries: ant.typer.pl (24370), ilo.byper.pl (24341), hzh.0xox0x0x0.com (23978)  
+**Source:** `analyzer.log`  
+2 protocol analyzer failures on port 3389 from 113.105.164.28 targeting 10.128.239.57 with failure reason: Invalid version late in TLS connection. Packet reported version: 0  
 
 #### MITRE ATT&CK
 
-- **Command and Control** / Application Layer Protocol (`T1071.004`)
+- **Initial Access** / External Remote Services (`T1133`)
 
 
-### Finding MI-004: SSL/TLS Certificate Anomaly - RFC Reserved IP as SNI
+### Finding MI-003: RFC-Reserved IP in SSL SNI — C2 Indicator
 
 **Severity:** CRITICAL  
 
-SSL log shows 1663 sessions with server_name=198.51.100.1, which is a TEST-NET IP (RFC 5737) that should never appear in production traffic. This indicates NAT/proxy setup where attacker infrastructure is behind intermediary, preventing TLS inspection.
+SSL/TLS sessions observed with server_name field containing 198.51.100.1 (1663 sessions). This is an RFC 5737 TEST-NET-2 reserved IP address that should NEVER appear in production traffic. This indicates the attacker is using a NAT/proxy setup where the internal address leaks into the SSL handshake, a strong C2 indicator. The same IP (198.51.100.1:3389) appeared in HTTP Host headers for /wsman requests from external IP 5.182.209.113.
 
 #### Evidence
 
 **Source:** `ssl.log`  
-1663 SSL sessions to server_name 198.51.100.1 (TEST-NET-2 range)  
+1663 SSL sessions with server_name=198.51.100.1. Also found in http.log Host header for /wsman requests.  
 
 #### MITRE ATT&CK
 
-- **Command and Control** / Encrypted Channel (`T1573.002`)
+- **Command and Control** / Protocol Tunneling (`T1572`)
+
+
+### Finding MI-004: Suspicious High-Volume DNS Activity
+
+**Severity:** CRITICAL  
+
+Multiple suspicious domains detected with anomalously high query volumes in top-30 DNS queries: ant.typer.pl (24370 queries), ilo.byper.pl (24341 queries), hzh.0xox0x0x0.com (23978 queries). These random-looking domains with high sustained query frequency are hallmarks of periodic C2 beaconing. The query volumes rival legitimate internal services, indicating persistent C2 communication.
+
+#### Evidence
+
+**Source:** `dns.log`  
+Top DNS queries include ant.typer.pl (24370), ilo.byper.pl (24341), hzh.0xox0x0x0.com (23978) - all suspicious domains with high query volumes indicating C2 beaconing.  
+
+#### MITRE ATT&CK
+
+- **Command and Control** / Application Layer Protocol (`T1071.004`)
 
 
 ### Finding IA-001: HTTP CONNECT Tunneling Detected
@@ -478,7 +491,7 @@ Detected 8 WinRM request(s) from 1 internal source(s). WinRM enables remote Powe
 
 **Severity:** HIGH  
 
-Detected 52 DNS lookup(s) for known exfiltration domains: temp.sh. Querying hosts: 10.128.239.21, 10.128.239.20, 10.128.239.57.
+Detected 52 DNS lookup(s) for known exfiltration domains: temp.sh. Querying hosts: 10.128.239.57, 10.128.239.20, 10.128.239.21.
 
 #### Evidence
 
@@ -526,7 +539,7 @@ Found 2474 SMB file record(s) referencing known file transfer tools: hfs, 7z, nc
 
 **Severity:** HIGH  
 
-Analyzed 17 PE file record(s). Architectures: I386(8), AMD64(9). 17 file(s) have compile timestamps. Sections observed: .text, .reloc, .rdata, .pdata, .didat, .retplne, .data, .rsrc. Dual-architecture binaries detected (I386, AMD64). This may indicate a multi-platform dropper.
+Analyzed 17 PE file record(s). Architectures: I386(8), AMD64(9). 17 file(s) have compile timestamps. Sections observed: .data, .didat, .rsrc, .rdata, .pdata, .retplne, .reloc, .text. Dual-architecture binaries detected (I386, AMD64). This may indicate a multi-platform dropper.
 
 #### Evidence
 
@@ -538,48 +551,48 @@ Analyzed 17 PE file record(s). Architectures: I386(8), AMD64(9). 17 file(s) have
 - **Command and Control** / Ingress Tool Transfer (`T1105`)
 
 
-### Finding MI-001: Attack Dwell Time Analysis
+### Finding MI-002: Attack Dwell Time Analysis
 
 **Severity:** HIGH  
 
-Attack spanned 72.7 days from 2025-11-18 to 2026-01-30. Privilege escalation appeared within 48 hours of initial access. Multiple exfiltration episodes detected indicating staged double-extortion ransomware campaign.
+Total dwell time: 72.7 days (2025-11-18 13:30:23 UTC to 2026-01-30 05:08:23 UTC). Privilege escalation/lateral movement appeared within 48 hours of initial access (credential spray and NTLM lateral movement detected from Patient Zero 10.128.239.57). Multiple exfiltration episodes observed: DNS lookups to temp.sh clustered around 2025-11-21, with SSL sessions to exfil destinations grouped into 2 time clusters, indicating staged double-extortion data theft.
 
 #### Evidence
 
 **Source:** `rdp.log`  
-Time range: 2025-11-18 13:30:23 UTC to 2026-01-30 05:08:23 UTC (72.7 days)  
+Time range 2025-11-18 13:30:23 UTC to 2026-01-30 05:08:23 UTC (72.7 days). Patient Zero 10.128.239.57 first targeted at 2025-11-18 13:30:23 UTC. Credential spray and NTLM lateral movement detected from Patient Zero within first 48 hours. Exfiltration activity to temp.sh observed in multiple time clusters.  
 
 #### MITRE ATT&CK
 
 - **Initial Access** / Initial Access (`T1133`)
 
 
-### Finding MI-002: Non-Standard PE Section Names Detected
+### Finding MI-005: Non-Standard PE Section Names Detected
 
 **Severity:** HIGH  
 
-PE binary analysis revealed non-standard section names: .retplne (9 files) and .didat (8 files). These are not standard Windows PE sections and indicate packed or obfuscated executables consistent with attacker tooling.
+PE binary analysis revealed non-standard section names: .retplne (9 PE files) and .didat (8 PE files). These are not part of the standard Windows PE section set (.text, .rdata, .data, .rsrc, .reloc, .bss, .idata, .edata, .pdata, .debug, .tls, .xdata). Non-standard section names indicate packed, obfuscated, or custom-compiled executables, consistent with attacker tooling designed to evade detection.
 
 #### Evidence
 
 **Source:** `pe.log`  
-Section names: .text,.rdata,.data,.pdata,.retplne,.rsrc,.reloc (9 files); .text,.rdata,.data,.didat,.rsrc,.reloc (8 files)  
+Top PE section names: .text,.rdata,.data,.pdata,.retplne,.rsrc,.reloc (9 files) and .text,.rdata,.data,.didat,.rsrc,.reloc (8 files). Sections .retplne and .didat are non-standard.  
 
 #### MITRE ATT&CK
 
 - **Defense Evasion** / Obfuscated Files or Information (`T1027`)
 
 
-### Finding MI-005: Unexpected Remote Access Tool Detected
+### Finding MI-006: Unexpected Remote Access Tool Detected
 
 **Severity:** HIGH  
 
-WicaAgent remote access tool detected on host 10.128.239.176. This is not standard enterprise software and indicates attacker-installed persistence mechanism for reconnection capability.
+WicaAgent (remote access tool) detected on host 10.128.239.176. This is not standard enterprise software and indicates attacker-installed persistence. The attacker can reconnect at will using this tool even if the original RDP session is blocked. First seen at 2025-12-19 14:30:26 UTC.
 
 #### Evidence
 
 **Source:** `software.log`  
-WicaAgent detected on 10.128.239.176 at timestamps 1766219426 and 1767542497  
+WicaAgent software detected on host 10.128.239.176 at timestamps 1766219426 and 1767542497.  
 
 #### MITRE ATT&CK
 
@@ -622,7 +635,7 @@ Detected 10 request(s) to IP reconnaissance services (comae.com). 10 host(s) per
 
 **Severity:** MEDIUM  
 
-Detected 20000 access(es) to GPO files via SMB: gpt.ini(5000), Registry.xml(5000), Groups.xml(5000), audit.csv(5000). Accessing hosts: 10.128.239.80, 10.128.239.43, 10.128.239.45, 10.128.239.42, 10.128.239.163, 10.128.239.138, 10.128.239.92, 10.128.239.32, 10.128.239.76, 10.128.239.69. GPO manipulation can be used for persistence and mass deployment of malware.
+Detected 20000 access(es) to GPO files via SMB: gpt.ini(5000), Registry.xml(5000), Groups.xml(5000), audit.csv(5000). Accessing hosts: 10.128.239.72, 10.128.239.106, 10.128.239.70, 10.128.239.87, 10.128.239.95, 10.128.239.82, 10.128.239.76, 10.128.239.136, 10.128.239.141, 10.128.239.77. GPO manipulation can be used for persistence and mass deployment of malware.
 
 #### Evidence
 
@@ -638,7 +651,7 @@ Detected 20000 access(es) to GPO files via SMB: gpt.ini(5000), Registry.xml(5000
 
 **Severity:** MEDIUM  
 
-Detected 15 file(s) matching suspicious patterns: ManageEngine(5), .ps1(10). Unique filenames: domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\Machine\\Preferences\\Registry\\Registry.xml, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Microsoft\\Windows NT\\Audit\\audit.csv, domain-ees3Ai.local\\Policies\\{2FEC0F4D-939C-4687-B7D4-8713D25EE390}\\Machine\\Preferences\\Registry\\Registry.xml, domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\gpt.ini, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Preferences\\Registry\\Registry.xml, domain-ees3Ai.local\\Policies\\{6AC1786C-016F-11D2-945F-00C04fB984F9}\\gpt.ini, domain-ees3Ai.local\\Policies\\{8CE247EA-1557-4ABB-B6B4-9FEAC57CBE27}\\gpt.ini, ManageEngine_PMP_64bit.exe, ManageEngine_RMM_Server.exe, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\gpt.ini.
+Detected 15 file(s) matching suspicious patterns: ManageEngine(5), .ps1(10). Unique filenames: domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\gpt.ini, domain-ees3Ai.local\\Policies\\{8CE247EA-1557-4ABB-B6B4-9FEAC57CBE27}\\gpt.ini, domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\Machine\\Preferences\\Registry\\Registry.xml, domain-ees3Ai.local\\Policies\\{6AC1786C-016F-11D2-945F-00C04fB984F9}\\gpt.ini, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\gpt.ini, ManageEngine_PMP_64bit.exe, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Microsoft\\Windows NT\\Audit\\audit.csv, ManageEngine_RecoveryManagerPlus_Bundle.exe, domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Preferences\\Registry\\Registry.xml, ManageEngine_RMM_Server.exe.
 
 #### Evidence
 
@@ -650,16 +663,16 @@ Detected 15 file(s) matching suspicious patterns: ManageEngine(5), .ps1(10). Uni
 - **Impact** /  (`T1486`)
 
 
-### Finding MI-006: External IP Reconnaissance via Software Tool
+### Finding MI-007: External IP Reconnaissance via Software Tool
 
 **Severity:** MEDIUM  
 
-Comae IP discovery tool detected on 10 internal hosts (10.128.239.176, 10.128.239.37, 10.128.239.65, 10.128.239.34, 10.128.239.21, 10.128.239.64, 10.128.239.57, 10.128.239.20, 10.128.239.36, 10.128.239.39). This indicates post-pivot reconnaissance to confirm egress IP routing.
+Comae (IP reconnaissance tool) detected on multiple internal hosts: 10.128.239.176, 10.128.239.37, 10.128.239.65, 10.128.239.34, 10.128.239.21, 10.128.239.64, 10.128.239.57, 10.128.239.20, 10.128.239.36, 10.128.239.39. Attackers frequently check their external egress IP after pivoting to confirm they are routing through the right path. This is post-pivot reconnaissance behavior.
 
 #### Evidence
 
 **Source:** `software.log`  
-Comae tool detected on 10 hosts performing IP discovery  
+Comae software detected on 10 internal hosts between timestamps 1767931407 and 1768618903.  
 
 #### MITRE ATT&CK
 
@@ -675,20 +688,20 @@ Comae tool detected on 10 hosts performing IP discovery
 | --- | --- | --- | --- | --- |
 | `196.251.89.107` | External IP using HTTP CONNECT tunnel | — | — | initial_access |
 | `89.248.163.217` | External IP using HTTP CONNECT tunnel | — | — | initial_access |
-| `20.65.194.87` | External IP accessing internal HTTP services | — | — | initial_access |
-| `80.82.70.133` | External IP accessing internal HTTP services | — | — | initial_access |
-| `139.144.52.241` | External IP accessing internal HTTP services | — | — | initial_access |
-| `162.216.150.182` | External IP accessing internal HTTP services | — | — | initial_access |
-| `5.182.209.113` | External IP accessing internal HTTP services | — | — | initial_access |
-| `15.204.142.151` | External IP accessing internal HTTP services | — | — | initial_access |
 | `144.126.223.152` | External IP accessing internal HTTP services | — | — | initial_access |
-| `178.128.228.86` | External IP accessing internal HTTP services | — | — | initial_access |
-| `20.65.193.148` | External IP accessing internal HTTP services | — | — | initial_access |
 | `134.209.246.246` | External IP accessing internal HTTP services | — | — | initial_access |
+| `162.216.150.182` | External IP accessing internal HTTP services | — | — | initial_access |
+| `178.128.228.86` | External IP accessing internal HTTP services | — | — | initial_access |
+| `20.65.194.87` | External IP accessing internal HTTP services | — | — | initial_access |
+| `15.204.142.151` | External IP accessing internal HTTP services | — | — | initial_access |
+| `18.191.28.175` | External IP accessing internal HTTP services | — | — | initial_access |
+| `20.65.193.148` | External IP accessing internal HTTP services | — | — | initial_access |
+| `80.82.70.133` | External IP accessing internal HTTP services | — | — | initial_access |
 | `152.32.170.230` | External IP accessing internal HTTP services | — | — | initial_access |
 | `152.32.234.184` | External IP accessing internal HTTP services | — | — | initial_access |
-| `18.191.28.175` | External IP accessing internal HTTP services | — | — | initial_access |
 | `20.150.201.102` | External IP accessing internal HTTP services | — | — | initial_access |
+| `5.182.209.113` | External IP accessing internal HTTP services | — | — | initial_access |
+| `139.144.52.241` | External IP accessing internal HTTP services | — | — | initial_access |
 | `185.147.124.48` | External IP initiating RDP | — | — | initial_access |
 | `141.98.11.96` | External IP initiating RDP | — | — | initial_access |
 | `193.111.248.57` | External IP initiating RDP | — | — | initial_access |
@@ -873,15 +886,15 @@ Comae tool detected on 10 hosts performing IP discovery
 | `10.128.239.98` | Credential spray source (25576 failures) | — | — | lateral_movement |
 | `10.128.239.140` | SAMR enumeration source (7678 ops) | — | — | lateral_movement |
 | `10.128.239.155` | SAMR enumeration source (58 ops) | — | — | lateral_movement |
-| `10.128.239.21` | SOCKS proxy chain pivot point | — | — | lateral_movement |
-| `10.128.239.25` | SOCKS proxy chain pivot point | — | — | lateral_movement |
-| `10.128.239.28` | SOCKS proxy chain pivot point | — | — | lateral_movement |
-| `10.128.239.31` | SOCKS proxy chain pivot point | — | — | lateral_movement |
 | `10.128.239.29` | SOCKS proxy chain pivot point | — | — | lateral_movement |
-| `10.128.239.88` | SOCKS proxy chain pivot point | — | — | lateral_movement |
 | `10.128.239.23` | SOCKS proxy chain pivot point | — | — | lateral_movement |
-| `10.128.239.20` | SOCKS proxy chain pivot point | — | — | lateral_movement |
+| `10.128.239.28` | SOCKS proxy chain pivot point | — | — | lateral_movement |
+| `10.128.239.25` | SOCKS proxy chain pivot point | — | — | lateral_movement |
+| `10.128.239.21` | SOCKS proxy chain pivot point | — | — | lateral_movement |
 | `10.128.239.26` | SOCKS proxy chain pivot point | — | — | lateral_movement |
+| `10.128.239.31` | SOCKS proxy chain pivot point | — | — | lateral_movement |
+| `10.128.239.88` | SOCKS proxy chain pivot point | — | — | lateral_movement |
+| `10.128.239.20` | SOCKS proxy chain pivot point | — | — | lateral_movement |
 | `10.128.239.82` | Internal WinRM source (1 targets) | — | — | lateral_movement |
 | `51.91.79.17` | Resolved IP for known exfil domain | — | — | exfiltration |
 | `10.128.239.176` | Host performing IP reconnaissance | — | — | exfiltration |
@@ -889,17 +902,17 @@ Comae tool detected on 10 hosts performing IP discovery
 | `10.128.239.37` | Host performing IP reconnaissance | — | — | exfiltration |
 | `10.128.239.64` | Host performing IP reconnaissance | — | — | exfiltration |
 | `10.128.239.65` | Host performing IP reconnaissance | — | — | exfiltration |
-| `10.128.239.80` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.43` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.45` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.42` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.163` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.138` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.92` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.72` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.106` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.70` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.87` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.95` | Host accessing GPO files via SMB | — | — | payload |
 | `10.128.239.76` | Host accessing GPO files via SMB | — | — | payload |
-| `10.128.239.69` | Host accessing GPO files via SMB | — | — | payload |
-| `113.105.164.28` | External IP with protocol analyzer failures on RDP port 3389, non-standard cookie values | — | — | initial_access |
-| `198.51.100.1` | TEST-NET IP appearing as SSL SNI - indicates NAT/proxy C2 infrastructure | — | — | command_and_control |
+| `10.128.239.136` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.141` | Host accessing GPO files via SMB | — | — | payload |
+| `10.128.239.77` | Host accessing GPO files via SMB | — | — | payload |
+| `113.105.164.28` | Protocol analyzer failure on RDP port 3389 — non-standard TLS traffic, targeted attacker signal | — | — | initial_access |
+| `198.51.100.1` | RFC 5737 TEST-NET-2 reserved IP appearing as SSL SNI - C2 indicator | — | — | initial_access |
 
 ### Domains
 
@@ -908,9 +921,9 @@ Comae tool detected on 10 hosts performing IP discovery
 | `srv57c0d2365c3c.korsan.me` | C2 tunnel destination (HTTP CONNECT) | — | — | initial_access |
 | `example.com` | C2 tunnel destination (HTTP CONNECT) | — | — | initial_access |
 | `temp.sh` | Known exfil domain (52 DNS lookups) | — | — | exfiltration |
-| `ant.typer.pl` | Suspicious high-volume DNS query (24370 queries) - potential C2 beacon | — | — | exfiltration |
-| `ilo.byper.pl` | Suspicious high-volume DNS query (24341 queries) - potential C2 beacon | — | — | exfiltration |
-| `hzh.0xox0x0x0.com` | Suspicious high-volume DNS query (23978 queries) - potential C2 beacon | — | — | exfiltration |
+| `ant.typer.pl` | Suspicious domain with 24370 DNS queries - high-volume C2 beaconing | — | — | exfiltration |
+| `ilo.byper.pl` | Suspicious domain with 24341 DNS queries - high-volume C2 beaconing | — | — | exfiltration |
+| `hzh.0xox0x0x0.com` | Suspicious domain with 23978 DNS queries - high-volume C2 beaconing | — | — | exfiltration |
 
 ### Accounts
 
@@ -964,19 +977,19 @@ Comae tool detected on 10 hosts performing IP discovery
 | `Software\\GeoServer-2.24.2-winsetup.exe` | Large executable (118876784 bytes) staged via SMB | — | — | payload |
 | `hfs.exe` | Large executable (5061120 bytes) staged via SMB | — | — | payload |
 | `MBSetup.exe` | Large executable (2086424 bytes) staged via SMB | — | — | payload |
-| `domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Microsoft\\Windows NT\\Audit\\audit.csv` | Executable staged via SMB | — | — | payload |
 | `delete.me` | Executable staged via SMB | — | — | payload |
-| `git.exe` | Executable staged via SMB | — | — | payload |
 | `domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Preferences\\Registry\\Registry.xml` | Executable staged via SMB | — | — | payload |
 | `UninstallWinClient.exe` | Executable staged via SMB | — | — | payload |
 | `domain-ees3Ai.local\\Policies\\{DBFEF99B-48F3-4F0C-9B4F-F546CE81EA16}\\Machine\\Preferences\\Groups\\Groups.xml` | Executable staged via SMB | — | — | payload |
-| `domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\Machine\\Preferences\\Registry\\Registry.xml` | Suspicious file on SMB share | — | — | payload |
-| `domain-ees3Ai.local\\Policies\\{2FEC0F4D-939C-4687-B7D4-8713D25EE390}\\Machine\\Preferences\\Registry\\Registry.xml` | Suspicious file on SMB share | — | — | payload |
+| `git.exe` | Executable staged via SMB | — | — | payload |
+| `domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\Machine\\Microsoft\\Windows NT\\Audit\\audit.csv` | Executable staged via SMB | — | — | payload |
 | `domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\gpt.ini` | Suspicious file on SMB share | — | — | payload |
-| `domain-ees3Ai.local\\Policies\\{6AC1786C-016F-11D2-945F-00C04fB984F9}\\gpt.ini` | Suspicious file on SMB share | — | — | payload |
 | `domain-ees3Ai.local\\Policies\\{8CE247EA-1557-4ABB-B6B4-9FEAC57CBE27}\\gpt.ini` | Suspicious file on SMB share | — | — | payload |
+| `domain-ees3Ai.local\\Policies\\{BF6EA5BB-0B35-44A5-A8E7-EE54C4FC12D5}\\Machine\\Preferences\\Registry\\Registry.xml` | Suspicious file on SMB share | — | — | payload |
+| `domain-ees3Ai.local\\Policies\\{6AC1786C-016F-11D2-945F-00C04fB984F9}\\gpt.ini` | Suspicious file on SMB share | — | — | payload |
 | `domain-ees3Ai.local\\Policies\\{7DDF95F4-B2B9-4BCD-8D81-9750119A5BB3}\\gpt.ini` | Suspicious file on SMB share | — | — | payload |
 | `domain-ees3Ai.local\\Policies\\{AAD79D81-3A5A-47B0-8A8F-EEA55525D6B3}\\gpt.ini` | Suspicious file on SMB share | — | — | payload |
+| `domain-ees3Ai.local\\Policies\\{2FEC0F4D-939C-4687-B7D4-8713D25EE390}\\Machine\\Preferences\\Registry\\Registry.xml` | Suspicious file on SMB share | — | — | payload |
 
 
 ## Attack Timeline
@@ -1067,8 +1080,8 @@ Comae tool detected on 10 hosts performing IP discovery
 
 ## Recommendations
 
-1. IMMEDIATE: 6 critical finding(s) require urgent incident response.
-2. Block attacker IP(s) at perimeter firewall: 196.251.89.107, 89.248.163.217, 20.65.194.87, 80.82.70.133, 139.144.52.241, 162.216.150.182, 5.182.209.113, 15.204.142.151, 144.126.223.152, 178.128.228.86.
+1. IMMEDIATE: 7 critical finding(s) require urgent incident response.
+2. Block attacker IP(s) at perimeter firewall: 196.251.89.107, 89.248.163.217, 144.126.223.152, 134.209.246.246, 162.216.150.182, 178.128.228.86, 20.65.194.87, 15.204.142.151, 18.191.28.175, 20.65.193.148.
 3. Block exfiltration/C2 domains: srv57c0d2365c3c.korsan.me, example.com, temp.sh, ant.typer.pl, ilo.byper.pl, hzh.0xox0x0x0.com.
 4. Reset credentials for: -, svc_backup, backup_safety, 123, admin, administrator, alex, enter, game, guest.
 
@@ -1076,19 +1089,19 @@ Comae tool detected on 10 hosts performing IP discovery
 
 | Metric | Value |
 | --- | --- |
-| Total LLM calls | 43 |
-| Total tool invocations | 81 |
-| Input tokens | 1,712,245 |
-| Output tokens | 20,460 |
-| Wall-clock time | 6m 56s |
+| Total LLM calls | 42 |
+| Total tool invocations | 77 |
+| Input tokens | 1,992,109 |
+| Output tokens | 23,712 |
+| Wall-clock time | 8m 16s |
 
 ### Cost Comparison
 
 | Execution Mode | Estimated Cost |
 | --- | --- |
-| Paid API | $3.6700 |
-| Local GPU (Local GPU @ $4.50/hr) | $0.5200 |
-| Savings with local execution | 86% |
+| Paid API | $4.2688 |
+| Local GPU (Local GPU @ $4.50/hr) | $0.6204 |
+| Savings with local execution | 85% |
 
 ## Appendix: Agent Reasoning Trace
 
@@ -1096,88 +1109,93 @@ The following is the agent's autonomous reasoning trail during investigation.
 
 1. [Step 1] This is a comprehensive forensic investigation task. I need to follow the structured approach outlined in the system prompt:
 
-1. **Phase 1: Data Acquisition** - Check existing logs, then ingest PCAPs if needed
+1. **Phase 1: Data Acquisition** - Check existing logs coverage, then ingest PCAPs if needed
 2. **Phase 2: Macro Analysis** - Run the four macro analysis tools
-3. **Phase 3: Micro Investigation** - Complete all mandatory tasks (3A-3J)
-4. **Phase 4: Record New Findings** - Record findings not covered by macros
-5. **Phase 5: Completion** - Mark investigation complete
-
-Let me start w
+3. **Phase 3: Micro Investigation** - Complete all mandatory micro tasks (3A-3J)
+4. **Phase 4: Record New Findings** - Record any new findings not covered by macros
+5. **Phase 5: Completion** - Mark investigation c
 2. [Step 1] Agent reasoned but did not call a tool.
 3. [Step 2] {"name": "list_available_logs", "arguments": {}}
 4. [Step 3] {"name": "get_time_range", "arguments": {"log_name": "conn.log"}}
 5. [Step 4] {"name": "run_initial_access_analysis", "arguments": {}}
-6. [Step 5] {"name": "run_lateral_movement_analysis", "arguments": {}}
-7. [Step 6] {"name": "run_exfiltration_analysis", "arguments": {}}
-8. [Step 7] {"name": "run_payload_analysis", "arguments": {}}
-9. [Step 8] {"name": "top_n_values", "arguments": {"log_name": "rdp.log", "field": "id.orig_h", "n": 20}}
-10. [Step 9] {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "179.60.146.33"}}
+{"name": "run_lateral_movement_analysis", "arguments": {}}
+{"name": "run_exfiltration_analysis", "arguments": {}}
+{"name": "run_payload_analysis", "arguments": {}}
+6. [Step 5] {"name": "top_n_values", "arguments": {"log_name": "rdp.log", "field": "id.orig_h", "n": 20}}
+7. [Step 6] {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "179.60.146.33"}}
 {"name": "grep_count", "arguments": {"log_name": "ntlm.log", "pattern": "179.60.146.33"}}
 {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "179.60.146.37"}}
 {"name": "grep_count", "arguments": {"log_name": "ntlm.log", "pattern": "179.60.146.37"}}
 {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "141.98.83.70"}}
 {"name": "grep_count", "arguments": {"log_name": "n
-11. [Step 10] {"name": "top_n_values", "arguments": {"log_name": "http.log", "field": "id.orig_h", "n": 20}}
-12. [Step 11] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "mstshash=", "max_results": 50}}
-13. [Step 12] {"name": "read_log_head", "arguments": {"log_name": "rdp.log", "n": 20}}
-14. [Step 13] {"name": "top_n_values_filtered", "arguments": {"log_name": "rdp.log", "filter_field": "id.resp_h", "filter_value": "10.128.239.57", "count_field": "id.orig_h", "n": 20}}
-15. [Step 14] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "179.60.146.33", "max_results": 5}}
-16. [Step 15] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "5.182.209.113", "max_results": 5}}
-17. [Step 16] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "196.251.89.107", "max_results": 5}}
-18. [Step 17] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "80.82.70.133", "max_results": 5}}
-19. [Step 18] {"name": "grep_log", "arguments": {"log_name": "analyzer.log", "pattern": "3389", "max_results": 50}}
+8. [Step 7] {"name": "top_n_values", "arguments": {"log_name": "http.log", "field": "id.orig_h", "n": 20}}
+9. [Step 8] {"name": "grep_log", "arguments": {"log_name": "analyzer.log", "pattern": "3389", "max_results": 50}}
 {"name": "grep_log", "arguments": {"log_name": "dpd.log", "pattern": "3389", "max_results": 50}}
 {"name": "grep_log", "arguments": {"log_name": "weird.log", "pattern": "data_before_established", "max_results": 30}}
-20. [Step 19] {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "113.105.164.28"}}
-{"name": "grep_count", "arguments": {"log_name": "ntlm.log", "pattern": "113.105.164.28"}}
-21. [Step 20] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "113.105.164.28", "max_results": 5}}
-22. [Step 21] {"name": "get_time_range", "arguments": {"log_name": "rdp.log"}}
+10. [Step 9] {"name": "record_ioc", "arguments": {"ioc_type": "ip", "value": "113.105.164.28", "context": "Protocol analyzer failure on RDP port 3389 — non-standard TLS traffic, targeted attacker signal", "source_phase": "initial_access"}}
+{"name": "record_finding", "arguments": {"title": "RDP Protocol Anomaly — Targeted Attacker Identified", "description": "External IP 113.105.164.28 triggered SSL protocol analyzer failures on RDP port 3389 with 'Invalid version late in TLS connection. Packet reported versi
+11. [Step 10] {"name": "grep_count", "arguments": {"log_name": "rdp.log", "pattern": "113.105.164.28"}}
+{"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "113.105.164.28"}}
+{"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "mstshash=", "max_results": 50}}
+12. [Step 11] {"name": "top_n_values_filtered", "arguments": {"log_name": "rdp.log", "filter_field": "id.resp_h", "filter_value": "10.128.239.57", "count_field": "id.orig_h", "n": 20}}
+13. [Step 12] {"name": "grep_log", "arguments": {"log_name": "rdp.log", "pattern": "113.105.164.28", "max_results": 10}}
+14. [Step 13] {"name": "grep_log", "arguments": {"log_name": "analyzer.log", "pattern": "3389", "max_results": 100}}
+15. [Step 14] {"name": "get_time_range", "arguments": {"log_name": "rdp.log"}}
 {"name": "get_time_range", "arguments": {"log_name": "conn.log"}}
-23. [Step 22] {"name": "find_auth_failures", "arguments": {"log_name": "ntlm.log"}}
+16. [Step 15] {"name": "record_finding", "arguments": {"title": "Attack Dwell Time Analysis", "description": "Total dwell time: 72.7 days (2025-11-18 13:30:23 UTC to 2026-01-30 05:08:23 UTC). Privilege escalation/lateral movement appeared within 48 hours of initial access (credential spray and NTLM lateral movement detected from Patient Zero 10.128.239.57). Multiple exfiltration episodes observed: DNS lookups to temp.sh clustered around 2025-11-21, with SSL sessions to exfil destinations grouped into 2 time c
+17. [Step 16] {"name": "find_auth_failures", "arguments": {"log_name": "ntlm.log"}}
 {"name": "find_auth_successes", "arguments": {"log_name": "ntlm.log"}}
 {"name": "top_n_values", "arguments": {"log_name": "kerberos.log", "field": "client", "n": 20}}
-24. [Step 23] {"name": "grep_log", "arguments": {"log_name": "ntlm.log", "pattern": "10.128.239.57", "max_results": 30}}
-25. [Step 24] {"name": "grep_log", "arguments": {"log_name": "ntlm.log", "pattern": "id.orig_h.*10.128.239.57.*success.*T", "max_results": 30}}
-26. [Step 25] {"name": "grep_count", "arguments": {"log_name": "ntlm.log", "pattern": "10.128.239.57"}}
-27. [Step 26] {"name": "grep_count", "arguments": {"log_name": "dns.log", "pattern": "temp.sh"}}
+18. [Step 17] {"name": "grep_log", "arguments": {"log_name": "ntlm.log", "pattern": "10.128.239.57", "max_results": 30}}
+19. [Step 18] {"name": "grep_count", "arguments": {"log_name": "dns.log", "pattern": "temp.sh"}}
 {"name": "grep_count", "arguments": {"log_name": "dns.log", "pattern": "transfer.sh"}}
 {"name": "grep_count", "arguments": {"log_name": "dns.log", "pattern": "korsan.me"}}
 {"name": "grep_count", "arguments": {"log_name": "ssl.log", "pattern": "temp.sh"}}
 {"name": "grep_count", "arguments": {"log_name": "ssl.log", "pattern": "korsan.me"}}
-28. [Step 27] {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "CONNECT"}}
-{"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "CONNECT", "max_results": 20}}
-29. [Step 28] {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "wsman"}}
-{"name": "read_log_head", "arguments": {"log_name": "http.log", "n": 50}}
-30. [Step 29] {"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "wsman", "max_results": 20}}
-31. [Step 30] {"name": "read_log_head", "arguments": {"log_name": "socks.log", "n": 30}}
-32. [Step 31] {"name": "grep_log", "arguments": {"log_name": "smb_files.log", "pattern": "\\.exe", "max_results": 30}}
+20. [Step 19] {"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "CONNECT"}}
+{"name": "grep_count", "arguments": {"log_name": "http.log", "pattern": "wsman"}}
+21. [Step 20] {"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "CONNECT", "max_results": 20}}
+{"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "wsman", "max_results": 20}}
+22. [Step 21] {"name": "read_log_head", "arguments": {"log_name": "http.log", "n": 50}}
+23. [Step 22] {"name": "grep_log", "arguments": {"log_name": "http.log", "pattern": "Go-http-client|curl|python-requests|wget|PowerShell|Java", "max_results": 30}}
+24. [Step 23] {"name": "read_log_head", "arguments": {"log_name": "socks.log", "n": 30}}
+25. [Step 24] {"name": "grep_log", "arguments": {"log_name": "smb_files.log", "pattern": "\\.exe", "max_results": 30}}
 {"name": "grep_log", "arguments": {"log_name": "smb_files.log", "pattern": "hfs|winscp|filezilla|rclone|psexec|mimikatz|nc\\.exe|ncat", "max_results": 20}}
-33. [Step 32] {"name": "top_n_values", "arguments": {"log_name": "pe.log", "field": "section_names", "n": 20}}
-34. [Step 33] {"name": "top_n_values", "arguments": {"log_name": "smb_mapping.log", "field": "id.orig_h", "n": 20}}
+26. [Step 25] {"name": "top_n_values", "arguments": {"log_name": "pe.log", "field": "section_names", "n": 20}}
+27. [Step 26] {"name": "top_n_values", "arguments": {"log_name": "smb_mapping.log", "field": "id.orig_h", "n": 20}}
 {"name": "top_n_values", "arguments": {"log_name": "dce_rpc.log", "field": "id.orig_h", "n": 10}}
 {"name": "top_n_values", "arguments": {"log_name": "smb_mapping.log", "field": "path", "n": 30}}
-35. [Step 34] {"name": "grep_log", "arguments": {"log_name": "kerberos.log", "pattern": "ldap|cifs/.*dc|krbtgt|GC/", "max_results": 20}}
-36. [Step 35] {"name": "top_n_values", "arguments": {"log_name": "dns.log", "field": "query", "n": 30}}
-37. [Step 36] {"name": "top_n_values", "arguments": {"log_name": "ssl.log", "field": "server_name", "n": 30}}
-38. [Step 37] {"name": "grep_log", "arguments": {"log_name": "software.log", "pattern": "VNC|Remote.Desktop|RDP|AnyDesk|TeamViewer|ScreenConnect|Remote.Admin|WicaAgent|RemotePC|Splashtop|LogMeIn|GoToMyPC|DameWare|NetSupport", "max_results": 20}}
+28. [Step 27] {"name": "grep_log", "arguments": {"log_name": "kerberos.log", "pattern": "ldap|cifs/.*dc|krbtgt|GC/", "max_results": 20}}
+29. [Step 28] {"name": "top_n_values", "arguments": {"log_name": "dns.log", "field": "query", "n": 30}}
+30. [Step 29] {"name": "top_n_values", "arguments": {"log_name": "ssl.log", "field": "server_name", "n": 30}}
+31. [Step 30] {"name": "grep_log", "arguments": {"log_name": "software.log", "pattern": "VNC|Remote.Desktop|RDP|AnyDesk|TeamViewer|ScreenConnect|Remote.Admin|WicaAgent|RemotePC|Splashtop|LogMeIn|GoToMyPC|DameWare|NetSupport", "max_results": 20}}
 {"name": "grep_log", "arguments": {"log_name": "software.log", "pattern": "netcat|ncat|Metasploit|Meterpreter|CobaltStrike|mimikatz|PsExec|Impacket|Empire|PowerSploit|BloodHound|SharpHound", "max_results": 20}}
 {"name": "grep_log", "arguments": {"log_name": "software.
-39. [Step 38] {"name": "read_log_head", "arguments": {"log_name": "known_services.log", "n": 50}}
-40. [Step 39] {"name": "record_finding", "arguments": {"title": "Attack Dwell Time Analysis", "description": "Attack spanned 72.7 days from 2025-11-18 to 2026-01-30. Privilege escalation appeared within 48 hours of initial access. Multiple exfiltration episodes detected indicating staged double-extortion ransomware campaign.", "severity": "high", "evidence_log": "rdp.log", "evidence_description": "Time range: 2025-11-18 13:30:23 UTC to 2026-01-30 05:08:23 UTC (72.7 days)", "mitre_tactic": "Initial Access", "m
-41. [Step 40] {"name": "record_timeline_event", "arguments": {"timestamp": "1763472623", "description": "Initial RDP connection to Patient Zero 10.128.239.57 from external IP 185.147.124.48", "source_ip": "185.147.124.48", "dest_ip": "10.128.239.57", "phase": "initial_access", "mitre_id": "T1133"}}
-{"name": "record_timeline_event", "arguments": {"timestamp": "1763473180", "description": "Credential spray attack begins from compromised hosts 10.128.239.32, 10.128.239.36, 10.128.239.39, 10.128.239.98, 10.128.23
-42. [Step 41] The timeline event limit has been reached (30 events), which means I've recorded enough timeline events. Now I need to verify that all Phase 3 tasks are complete before calling mark_investigation_complete.
+32. [Step 31] {"name": "read_log_head", "arguments": {"log_name": "known_services.log", "n": 50}}
+33. [Step 32] {"name": "record_ioc", "arguments": {"ioc_type": "ip", "value": "198.51.100.1", "context": "RFC 5737 TEST-NET-2 reserved IP appearing as SSL SNI - C2 indicator", "source_phase": "initial_access"}}
+{"name": "record_finding", "arguments": {"title": "RFC-Reserved IP in SSL SNI — C2 Indicator", "description": "SSL/TLS sessions observed with server_name field containing 198.51.100.1 (1663 sessions). This is an RFC 5737 TEST-NET-2 reserved IP address that should NEVER appear in production traffic. Thi
+34. [Step 33] {"name": "record_ioc", "arguments": {"ioc_type": "domain", "value": "ant.typer.pl", "context": "Suspicious domain with 24370 DNS queries - high-volume C2 beaconing", "source_phase": "exfiltration"}}
+{"name": "record_ioc", "arguments": {"ioc_type": "domain", "value": "ilo.byper.pl", "context": "Suspicious domain with 24341 DNS queries - high-volume C2 beaconing", "source_phase": "exfiltration"}}
+{"name": "record_ioc", "arguments": {"ioc_type": "domain", "value": "hzh.0xox0x0x0.com", "context": "S
+35. [Step 34] {"name": "record_finding", "arguments": {"title": "Non-Standard PE Section Names Detected", "description": "PE binary analysis revealed non-standard section names: .retplne (9 PE files) and .didat (8 PE files). These are not part of the standard Windows PE section set (.text, .rdata, .data, .rsrc, .reloc, .bss, .idata, .edata, .pdata, .debug, .tls, .xdata). Non-standard section names indicate packed, obfuscated, or custom-compiled executables, consistent with attacker tooling designed to evade d
+36. [Step 35] {"name": "record_finding", "arguments": {"title": "Unexpected Remote Access Tool Detected", "description": "WicaAgent (remote access tool) detected on host 10.128.239.176. This is not standard enterprise software and indicates attacker-installed persistence. The attacker can reconnect at will using this tool even if the original RDP session is blocked. First seen at 2025-12-19 14:30:26 UTC.", "severity": "high", "evidence_log": "software.log", "evidence_description": "WicaAgent software detected
+37. [Step 36] {"name": "record_finding", "arguments": {"title": "External IP Reconnaissance via Software Tool", "description": "Comae (IP reconnaissance tool) detected on multiple internal hosts: 10.128.239.176, 10.128.239.37, 10.128.239.65, 10.128.239.34, 10.128.239.21, 10.128.239.64, 10.128.239.57, 10.128.239.20, 10.128.239.36, 10.128.239.39. Attackers frequently check their external egress IP after pivoting to confirm they are routing through the right path. This is post-pivot reconnaissance behavior.", "s
+38. [Step 37] {"name": "record_ioc", "arguments": {"ioc_type": "ip", "value": "5.182.209.113", "context": "External IP making WinRM /wsman requests with Go-http-client user-agent to Patient Zero", "source_phase": "initial_access"}}
+{"name": "record_finding", "arguments": {"title": "External WinRM Access Detected", "description": "External IP 5.182.209.113 made 16 POST requests to /wsman on internal host 10.128.239.57 (Patient Zero) using Go-http-client/1.1 user-agent. The Host header showed 198.51.100.1:3389 
+39. [Step 38] {"name": "record_finding", "arguments": {"title": "Suspicious HTTP User-Agents Detected", "description": "19 HTTP requests using suspicious User-Agent strings: Go-http-client/1.1. These are commonly associated with automated tooling or malware, not legitimate browsers. Requests originated from external IP 5.182.209.113 targeting internal host 10.128.239.57 on port 3389.", "severity": "medium", "evidence_log": "http.log", "evidence_description": "19 HTTP requests with user-agent Go-http-client/1.
+40. [Step 39] {"name": "record_timeline_event", "arguments": {"timestamp": "1763472881", "description": "First DNS lookup to exfiltration domain temp.sh from Patient Zero 10.128.239.57", "source_ip": "10.128.239.57", "dest_ip": "51.91.79.17", "phase": "exfiltration", "mitre_id": "T1567.002"}}
+{"name": "record_timeline_event", "arguments": {"timestamp": "1763472623", "description": "Initial RDP connection to Patient Zero 10.128.239.57 from external IP 179.60.146.33", "source_ip": "179.60.146.33", "dest_ip": "1
+41. [Step 40] The timeline event limit has been reached (30 events), which means I've recorded enough timeline events. Now I need to verify that all Phase 3 tasks are complete before calling mark_investigation_complete.
 
-Let me review the Phase 3 requirements:
+Let me review the Phase 3 checklist:
 
 **3A — Initial Access: Identify Primary Attacker IP** ✓
 - Top external IPs by RDP session count: Done
-- Cross-log presence check (http.log, ntlm.log): Done for top 5 IPs
-- Protocol anomaly check (analyzer.log, dpd.log, weird.log): Done
-- Patient Zero i
-43. [Step 41] Agent reasoned but did not call a tool.
-44. [Step 42] {"name": "mark_investigation_complete", "arguments": {}}
+- Cross-log presence check for top 5 IPs: Done (all had 0 hits in http.log and ntlm.log)
+- Protocol anomaly check: Done (found 113.105.164.28 in analyzer
+42. [Step 40] Agent reasoned but did not call a tool.
+43. [Step 41] {"name": "mark_investigation_complete", "arguments": {}}
 
 ---
 
-*Report generated by Agentic Network Forensic Agent.  Generated on 2026-04-07 14:07:38 UTC.*
+*Report generated by Agentic Network Forensic Agent.  Generated on 2026-04-07 15:29:31 UTC.*

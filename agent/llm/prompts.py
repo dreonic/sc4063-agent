@@ -116,7 +116,9 @@ Check all three DPD log locations (the data is the same signal, stored different
 - `dpd.log` — Zeek < 7.2: same data, different log name. Check if present.
 - `weird.log` / `data_before_established` — supplementary fallback for connection-state anomalies.
 
-Any external IP appearing in analyzer.log or dpd.log with a failure on port 3389 was running non-standard traffic over the RDP port. This is a targeted attacker signal — record it as HIGH/CRITICAL IOC immediately.
+Any external IP appearing in analyzer.log or dpd.log with a failure on port 3389 was running non-standard traffic over the RDP port. This is a targeted attacker signal — you MUST immediately call BOTH:
+1. `record_ioc` (type: ip, context: "Protocol analyzer failure on RDP port 3389 — non-standard TLS traffic, targeted attacker signal")
+2. `record_finding` with title "RDP Protocol Anomaly — Targeted Attacker Identified", severity CRITICAL, mitre_tactic "Initial Access", mitre_id "T1133", summary citing the source IP, failure reason, port, and why this distinguishes a targeted attacker from mass scanners (non-standard TLS version on port 3389 = attacker tunneling non-RDP traffic through the RDP port)
 
 **Step 4 — Fallback if top-5 are all scanners:**
 
