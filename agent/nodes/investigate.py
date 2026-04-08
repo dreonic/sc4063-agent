@@ -102,6 +102,13 @@ def _strip_tool_call_tags(text: str) -> str:
       <tool_call>{"name": ...}</tool_call>
     The tags themselves are not valid JSON and cause json.loads to fail.
     Strip matched pairs, orphaned closing tags, and orphaned opening tags.
+
+    Also handles the hybrid malformed format where the model mixes JSON and
+    Hermes XML-style function tags for parallel calls:
+      <function=tool_name", "arguments": {...}}
+    This is converted to valid JSON:
+      {"name": "tool_name", "arguments": {...}}
+    so that the multi-object JSON parser can extract all parallel calls.
     """
     if not text:
         return text
@@ -111,6 +118,18 @@ def _strip_tool_call_tags(text: str) -> str:
     cleaned = cleaned.replace("</tool_call>", "")
     # Pattern 3: orphaned opening tag — remove it
     cleaned = cleaned.replace("<tool_call>", "")
+    # Pattern 4: Hermes hybrid format — <function=name" continues as JSON args.
+    # Model emits: <function=grep_count", "arguments": {...}}
+    # Replace the tag prefix so it becomes: {"name": "grep_count", "arguments": {...}}
+    cleaned = re.sub(r'<function=(\w+)"', r'{"name": "\1"', cleaned)
+    # Pattern 5: Hermes pure XML function blocks — <function=name>...</function>
+    # These appear as empty duplicates when the model already emitted a valid JSON
+    # call earlier in the same message. Converting them to JSON produces an invalid
+    # half-formed object that poisons the multi-object parser and causes the valid
+    # first call to also be dropped. Strip the entire block instead.
+    cleaned = re.sub(r'<function=\w+>.*?</function>', '', cleaned, flags=re.DOTALL)
+    # Also strip any orphaned </function> tags (no matching opening tag left after above).
+    cleaned = cleaned.replace('</function>', '')
     return cleaned.strip()
 
 
@@ -168,6 +187,13 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
                 pass
 
         if payload is None:
+            # Warn when a candidate looks like a truncated tool call (starts with
+            # {"name": but failed to parse). This happens when the model's output
+            # was cut off by a token limit mid-string, producing an unterminated
+            # JSON string (e.g. "pattern": "id\\.orig_h.*10\\.128.*succe  <eof>).
+            if candidate.lstrip().startswith('{"name"'):
+                print(f"    [WARN] Could not parse tool call JSON (possibly truncated): "
+                      f"{candidate[:120]!r}")
             continue
 
         raw_calls = payload if isinstance(payload, list) else [payload]
@@ -449,8 +475,23 @@ def investigate_node(state: ForensicState) -> dict:
     # Run the ReAct loop manually (tool-calling loop)
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
+    # Build initial message list: system prompt, optional briefing, then task
+    briefing_text = state.get("briefing_text", "").strip()
+    briefing_message: list = []
+    if briefing_text:
+        briefing_message = [HumanMessage(content=(
+            "CLIENT BRIEFING DOCUMENTS\n"
+            "==========================\n"
+            "The following context was provided to the investigation team by the client "
+            "before analysis began. Use this to frame your investigation, but derive all "
+            "findings from the log evidence — do not assert facts from the briefing as "
+            "forensic findings unless confirmed by the data.\n\n"
+            f"{briefing_text}"
+        ))]
+
     messages = [
         SystemMessage(content=system_prompt),
+        *briefing_message,
         HumanMessage(content=(
             "Begin your autonomous forensic investigation. Analyze the network "
             "capture for signs of compromise. Use the available tools to examine "
@@ -468,6 +509,8 @@ def investigate_node(state: ForensicState) -> dict:
     iteration = 0
     # Rolling window of the last 6 tool names — used for loop detection
     _recent_tool_names: list[str] = []
+    # Rolling window of (tool_name, primary_arg) tuples for near-duplicate detection
+    _recent_tool_signatures: list[tuple[str, str]] = []
     # Session-level tracking of PCAP ingestion (mirrors what the tool closure tracks,
     # but accessible here without fragile closure introspection)
     _ingested_pcaps: set[str] = set()
@@ -595,6 +638,16 @@ def investigate_node(state: ForensicState) -> dict:
             if len(_recent_tool_names) > 6:
                 _recent_tool_names.pop(0)
 
+            # Track (tool_name, primary_arg) signature for near-duplicate detection.
+            # Primary arg: first string value in args (pattern, log_name, field, etc.)
+            _primary_arg = next(
+                (str(v)[:60] for v in tool_args.values() if isinstance(v, str)),
+                "",
+            )
+            _recent_tool_signatures.append((tool_name, _primary_arg))
+            if len(_recent_tool_signatures) > 12:
+                _recent_tool_signatures.pop(0)
+
             tracker.record_tool_invocation()
             if tool_name in tool_map:
                 invoke_args, dropped_args = _sanitize_tool_args(tool_map[tool_name], tool_args)
@@ -660,6 +713,32 @@ def investigate_node(state: ForensicState) -> dict:
                 '{"name": "mark_investigation_complete", "arguments": {}}\n'
                 "If Phase 3 tasks remain, call the next required micro tool instead."
             )))
+            _recent_tool_names.clear()
+
+        # Near-duplicate tool call loop: same (tool, log) pair called 3+ times in
+        # the last 8 analysis calls, regardless of pattern/max_results variation.
+        # Catches retry spirals where the model keeps re-querying the same log with
+        # slightly different patterns or growing max_results because it wants more
+        # data but the log simply does not have it.
+        _skip_tools = {"record_finding", "record_ioc", "record_timeline_event",
+                       "mark_investigation_complete"}
+        _analysis_sigs = [s for s in _recent_tool_signatures[-8:] if s[0] not in _skip_tools]
+        _stuck_sig = None
+        for _sig in set(_analysis_sigs):
+            if _analysis_sigs.count(_sig) >= 3:
+                _stuck_sig = _sig
+                break
+        if _stuck_sig:
+            from langchain_core.messages import HumanMessage as _HM
+            print(f"    [LOOP DETECTED] {_stuck_sig[0]}('{_stuck_sig[1]}') x{_analysis_sigs.count(_stuck_sig)} — injecting nudge")
+            messages.append(_HM(content=(
+                f"You have queried '{_stuck_sig[1]}' with {_stuck_sig[0]} "
+                f"{_analysis_sigs.count(_stuck_sig)} times and are not getting new information. "
+                "Stop retrying. The data you already have is the answer — draw your conclusion from it and move on. "
+                "If the log does not contain what you expected, that is itself a forensic finding worth noting. "
+                "Proceed to the next Phase 3 task, or call mark_investigation_complete if all tasks are done."
+            )))
+            _recent_tool_signatures.clear()
             _recent_tool_names.clear()
 
     if iteration >= max_iterations and not state_ref["investigation_complete"]:

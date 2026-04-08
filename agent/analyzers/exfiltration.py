@@ -282,7 +282,7 @@ class ExfiltrationAnalyzer:
         # Extract querying hosts and cluster into "waves"
         source_hosts = sorted(list(unique_values(recon_hits, "id.orig_h")))
         user_agents = sorted(list(unique_values(recon_hits, "user_agent")))
-        waves = cluster_by_time(recon_hits, "ts", gap_seconds=3600)
+        waves = cluster_by_time(recon_hits, "ts", gap_seconds=86400)
 
         for host in source_hosts[:10]:
             self._add_ioc(IOCType.IP, host, "Host performing IP reconnaissance", {}, "http.log")

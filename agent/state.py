@@ -16,6 +16,7 @@ class ForensicState(TypedDict, total=False):
     input_path: str
     pcap_path: str                                    # original PCAP (for tshark tools)
     log_dir: str                                      # resolved Zeek log directory
+    briefing_text: str                                # optional client briefing injected as context
 
     # --- Triage results ---
     log_inventory: list[dict]                         # serialised LogFile objects

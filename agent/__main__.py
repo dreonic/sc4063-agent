@@ -85,7 +85,46 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="GPU hourly rate in USD for cost comparison (overrides GPU_HOURLY_RATE env var).",
     )
+    parser.add_argument(
+        "--briefing",
+        default=None,
+        help=(
+            "Path to a folder containing briefing documents (.txt, .md). "
+            "All readable files in the folder are concatenated and injected as "
+            "client context at the start of the investigation."
+        ),
+    )
     return parser.parse_args()
+
+
+def _read_briefing_folder(folder: str) -> str:
+    """Read all .txt and .md files in *folder* and return them concatenated.
+
+    Each file is separated by a header showing its filename so the LLM
+    can distinguish multiple documents. Files that cannot be decoded as
+    UTF-8 are skipped with a warning.
+    """
+    p = Path(folder)
+    if not p.is_dir():
+        print(f"[WARN] --briefing path is not a directory: {folder}", file=sys.stderr)
+        return ""
+
+    parts: list[str] = []
+    for f in sorted(p.iterdir()):
+        if f.is_file() and f.suffix.lower() in {".txt", ".md"}:
+            try:
+                content = f.read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(f"--- {f.name} ---\n{content}")
+            except Exception as e:
+                print(f"[WARN] Could not read briefing file {f.name}: {e}", file=sys.stderr)
+
+    if not parts:
+        print(f"[WARN] No readable .txt or .md files found in briefing folder: {folder}",
+              file=sys.stderr)
+        return ""
+
+    return "\n\n".join(parts)
 
 
 def _apply_overrides(args: argparse.Namespace) -> None:
@@ -122,6 +161,11 @@ def main() -> None:
         print(f"[ERROR] Input path does not exist: {input_path}", file=sys.stderr)
         sys.exit(1)
 
+    # Load briefing documents if provided
+    briefing_text = ""
+    if args.briefing:
+        briefing_text = _read_briefing_folder(args.briefing)
+
     print()
     print("=" * 70)
     print("  SC4063 Forensic Agent — Autonomous Network Analysis")
@@ -131,6 +175,7 @@ def main() -> None:
     print(f"  Base URL    : {config.llm_base_url}")
     print(f"  Max iters   : {max_iterations}")
     print(f"  Human review: {args.human_review}")
+    print(f"  Briefing    : {args.briefing or '(none)'}")
     print(f"  Output      : {config.output_dir / config.report_filename}")
     print("=" * 70)
     print()
@@ -156,6 +201,7 @@ def main() -> None:
     initial_state: dict = {
         "input_path": str(input_path),
         "max_iterations": max_iterations,
+        "briefing_text": briefing_text,
     }
 
     try:

@@ -338,8 +338,13 @@ class ReportGenerator:
     def _render_recommendations(self) -> str:
         lines = ["## Recommendations", ""]
         if self.report.recommendations:
-            for idx, rec in enumerate(self.report.recommendations, 1):
-                lines.append(f"{idx}. {rec}")
+            # If a single multi-line item was stored (LLM-generated structured markdown),
+            # render it as-is so P1/P2/P3 structure is preserved.
+            if len(self.report.recommendations) == 1 and "\n" in self.report.recommendations[0]:
+                lines.append(self.report.recommendations[0])
+            else:
+                for idx, rec in enumerate(self.report.recommendations, 1):
+                    lines.append(f"{idx}. {rec}")
         else:
             lines.append("*No recommendations generated.*")
         return "\n".join(lines)

@@ -152,6 +152,12 @@ class InitialAccessAnalyzer:
         if not tunnels:
             return
 
+        # IANA-reserved and documentation domains that can never be attacker-controlled
+        _RESERVED_DOMAINS = {
+            "example.com", "example.net", "example.org", "example.edu",
+            "localhost", "invalid", "test", "local",
+        }
+
         c2_domains: list[str] = []
         for rec in tunnels:
             host_header = rec.get("host", "") or rec.get("uri", "")
@@ -159,8 +165,12 @@ class InitialAccessAnalyzer:
             ts = rec.get("ts", "")
 
             if host_header:
-                domain = host_header.split(":")[0]
-                if domain and domain not in c2_domains:
+                domain = host_header.split(":")[0].lower()
+                # Skip IANA-reserved domains — they cannot be registered by attackers
+                # and appear in scanner probes, conformance tests, and misconfigured clients
+                if not domain or domain in _RESERVED_DOMAINS:
+                    continue
+                if domain not in c2_domains:
                     c2_domains.append(domain)
                     self._add_ioc(IOCType.DOMAIN, domain, "C2 tunnel destination (HTTP CONNECT)", rec, "http.log")
 
